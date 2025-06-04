@@ -24,4 +24,4 @@ prophet==1.1.5         # Specific stable version, generally compatible with rece
 cython>=0.29,!=0.29.18,!=0.29.31 # Dependencia de compilación para pmdarima
 setuptools>=38.6.0,!=50.0.0      # "
 packaging>=17.1                  # "
-requests                         # Asegurarse de que esté aquí, es una dependencia de yfinance y prophet también
+requests                        
