@@ -2,4 +2,4 @@ build-essential
 python3-dev
 libopenblas-dev
 liblapack-dev
-gfortran # A veces necesario para dependencias de scipy/numpy que pmdarima podría usar indirectamente
+gfortran
