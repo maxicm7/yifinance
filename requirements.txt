@@ -1,22 +1,27 @@
-# Dependencias de compilación primero
-numpy>=1.21.2
-cython>=0.29,!=0.29.18,!=0.29.31
-setuptools>=38.6.0,!=50.0.0
-packaging>=17.1
+# Core Data Science Libraries
+pandas>=2.0.0,<2.2.0
+numpy>=1.23.0,<1.27.0  # Avoid numpy 2.0 for now for broader compatibility
+scipy>=1.10.0,<1.13.0
 
-# pmdarima y sus otras dependencias
-pmdarima==2.0.4 # Fija la versión si sabes que esta es la que quieres
-statsmodels>=0.13.2 # pmdarima ya lo pide, pero ser explícito no daña
-scipy>=1.3.2       # ""
-scikit-learn>=0.22 # ""
-pandas>=0.19       # ""
-joblib>=0.11       # ""
-urllib3            # ""
+# Visualization & Web App
+matplotlib>=3.7.0,<3.9.0
+streamlit>=1.30.0,<1.36.0
 
-# Resto de tus dependencias
-streamlit
-matplotlib
-yfinance
-requests
-prophet
-PyPortfolioOpt
+# Machine Learning & Stats Models
+scikit-learn>=1.3.0,<1.5.0
+statsmodels==0.14.2     # Pinning a specific stable version
+pmdarima==2.0.4         # Pinning a specific stable version compatible with statsmodels 0.14.x
+
+# Finance Data & Portfolio
+yfinance>=0.2.30,<0.3.0  # Specific recent version known to work well
+PyPortfolioOpt>=1.5.4,<1.6.0 # Stable 1.5.x range
+
+# Forecasting (Optional but included)
+prophet==1.1.5         # Specific stable version, generally compatible with recent pandas/numpy
+
+# Adicionalmente, para asegurar que las dependencias de compilación
+# de pmdarima se consideren, aunque tu lista ya es bastante explícita:
+cython>=0.29,!=0.29.18,!=0.29.31 # Dependencia de compilación para pmdarima
+setuptools>=38.6.0,!=50.0.0      # "
+packaging>=17.1                  # "
+requests                         # Asegurarse de que esté aquí, es una dependencia de yfinance y prophet también
