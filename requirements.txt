@@ -1,26 +1,25 @@
 # Core Libraries
 streamlit
-pandas
-numpy
+pandas==2.2.2
+numpy==1.26.4
 matplotlib
 scipy
-scikit-learn
+scikit-learn==1.4.2
+statsmodels==0.14.2
 
 # Time Series Forecasting Libraries
-statsmodels
 pmdarima
 yfinance
-
-# Optional/Advanced Forecasting Libraries (Cruciales para el código)
-# Nota: Prophet tiene dependencias de compilación (pystan) que pueden fallar
-# en algunos entornos de despliegue sin configuraciones adicionales.
-prophet
 tbats
+
+# Complex TS (pystan MUST be installed before prophet)
+pystan==2.19.1.1 
+prophet
 
 # Portfolio Optimization Library
 pyportfolioopt
 
-# Machine Learning Libraries (para modelos avanzados de forecasting)
+# Machine Learning Libraries
 xgboost
 lightgbm
 
