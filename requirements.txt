@@ -1,4 +1,4 @@
-# Core Libraries
+# Core Libraries (Aseguramos la compatibilidad)
 streamlit
 pandas==2.2.2
 numpy==1.26.4
@@ -12,18 +12,18 @@ pmdarima
 yfinance
 tbats
 
-# Complex TS (pystan MUST be installed before prophet)
-pystan==2.19.1.1 
-prophet
 
 # Portfolio Optimization Library
-pyportfolioopt
+# Versión estable compatible con numpy 1.26
+pyportfolioopt==1.5.5
 
-# Machine Learning Libraries
-xgboost
-lightgbm
+# Machine Learning Libraries (Estas son la fuente común de fallos binarios)
+# Fijamos versiones estables para evitar problemas de ABI
+xgboost==1.7.6
+lightgbm==3.3.5
 
 # API and Utilities
 requests
 huggingface-hub
 pypdf
+
