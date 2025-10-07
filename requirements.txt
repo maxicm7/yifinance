@@ -1,24 +1,30 @@
-# Dependencias de compilación críticas y Core
-numpy>=1.23.0,<1.27.0
-cython>=0.29,!=0.29.18,!=0.29.31
-setuptools>=38.6.0,!=50.0.0
-packaging>=17.1
-pandas>=2.0.0,<2.2.0
-scipy>=1.10.0,<1.13.0
+# Core Libraries
+streamlit
+pandas
+numpy
+matplotlib
+scipy
+scikit-learn
 
-# Machine Learning & Stats Models
-statsmodels==0.14.2
-scikit-learn>=1.3.0,<1.5.0
-pmdarima==2.0.4         #  <-- Esta es la que da problemas
+# Time Series Forecasting Libraries
+statsmodels
+pmdarima
+yfinance
 
-# Visualization & Web App
-matplotlib>=3.7.0,<3.9.0
-streamlit>=1.30.0,<1.36.0
+# Optional/Advanced Forecasting Libraries (Cruciales para el código)
+# Nota: Prophet tiene dependencias de compilación (pystan) que pueden fallar
+# en algunos entornos de despliegue sin configuraciones adicionales.
+prophet
+tbats
 
-# Finance Data & Portfolio
-yfinance>=0.2.30,<0.3.0
-PyPortfolioOpt>=1.5.4,<1.6.0
+# Portfolio Optimization Library
+pyportfolioopt
 
-# Forecasting (Optional but included)
-prophet==1.1.5
-requests # Asegurar que requests esté listado explícitamente
+# Machine Learning Libraries (para modelos avanzados de forecasting)
+xgboost
+lightgbm
+
+# API and Utilities
+requests
+huggingface-hub
+pypdf
