@@ -12,7 +12,7 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.graphics.tsaplots import plot_pacf
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.stats.diagnostic import acorr_ljungbox
-from scipy.stats import normaltest
+from scipy.stats import normaltest, norm # <--- Agregado norm para VaR
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import io
@@ -22,6 +22,13 @@ import yfinance as yf
 import warnings
 import traceback # For detailed error printing
 import json
+from huggingface_hub import InferenceClient
+import pypdf
+import io
+import random
+import time # Agregado para sleep/rerun
+
+
 
 # --- Dependencia para IOL ---
 import requests # Para hacer las llamadas a la API de IOL
@@ -38,6 +45,26 @@ try:
     pypfopt_installed = True
 except ImportError:
     pypfopt_installed = False
+    
+
+try:
+    from tbats import TBATS
+    tbats_installed = True
+except ImportError:
+    tbats_installed = False
+
+# --- NUEVAS DEPENDENCIAS ML ---
+try:
+    import xgboost as xgb
+    xgb_installed = True
+except ImportError:
+    xgb_installed = False
+
+try:
+    import lightgbm as lgb
+    lgbm_installed = True
+except ImportError:
+    lgbm_installed = False
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="Stock Analysis & Portfolio Tool")
@@ -48,7 +75,57 @@ PORTFOLIO_FILE = "portfolios_data1.json"
 # --- Constantes para IOL API ---
 IOL_API_BASE_URL = "https://api.invertironline.com"
 
-# --- Helper Functions (Forecasting App - Sin cambios) ---
+# --- NUEVO: Dependencias para Hugging Face y Chat ---
+from huggingface_hub import InferenceClient
+import pypdf
+import io
+
+# --- NUEVO: Funciones para la Integración con Hugging Face ---
+
+def get_hf_response(api_key, model, prompt, temperature=0.7, max_tokens=2048):
+    """
+    Función universal para llamar a la API de Hugging Face.
+    """
+    if not api_key or not api_key.startswith("hf_"):
+        st.error("Por favor, introduce una Hugging Face API Key válida en la barra lateral.")
+        return None
+    try:
+        client = InferenceClient(token=api_key)
+        messages = [{"role": "user", "content": prompt}]
+        response = client.chat_completion(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=False, # Importante para un retorno simple
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        st.error(f"Error al contactar la API de Hugging Face.")
+        st.info(
+            "Esto puede ocurrir por varias razones:\n"
+            "1. No tienes acceso a este modelo (visita su página en HF para solicitarlo).\n"
+            "2. El modelo está tardando en cargar en los servidores de HF. Espera un minuto y vuelve a intentarlo.\n"
+            "3. La API Key es incorrecta o no tiene los permisos necesarios."
+        )
+        print(f"Detalle del error de HF: {e}")
+        return None
+
+def extract_text_from_pdf(pdf_file):
+    """
+    Lee un archivo PDF subido a través de Streamlit y extrae su texto.
+    """
+    try:
+        pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_file.getvalue()))
+        text = "".join(page.extract_text() for page in pdf_reader.pages if page.extract_text())
+        return text
+    except Exception as e:
+        st.error(f"Error al leer el archivo PDF: {e}")
+        return ""
+
+# --- FIN de las nuevas funciones de Hugging Face ---
+
+# --- Helper Functions (Forecasting App - Modificado) ---
 def clean_file_name(name):
     name = re.sub(r'[<>:"/\\|?*]', '', name)
     name = re.sub(r'\s+', '_', name)
@@ -136,6 +213,34 @@ def treat_outliers_iqr(series: pd.Series, k: float = 1.5) -> tuple[pd.Series, in
     num_outliers_treated = (original_series != treated_series).sum()
     return treated_series, num_outliers_treated
 
+# --- NUEVA FUNCIÓN DE FEATURE ENGINEERING PARA MODELOS ML (XGBoost/LightGBM) ---
+def create_ts_features(df, lag_max=5):
+    """
+    Genera características de tiempo y rezagos para modelos basados en ML.
+    df debe contener la columna 'Actual' y, opcionalmente, la columna exógena.
+    """
+    df = df.copy()
+    
+    # 1. Características de fecha (deben estar presentes antes de cualquier dropna)
+    df['dayofweek'] = df.index.dayofweek
+    df['quarter'] = df.index.quarter
+    df['month'] = df.index.month
+    df['year'] = df.index.year
+    df['dayofyear'] = df.index.dayofyear
+    
+    # 2. Características de rezago (lags)
+    for lag in range(1, lag_max + 1):
+        # Siempre rezagamos la variable objetivo ('Actual')
+        df[f'lag_{lag}'] = df['Actual'].shift(lag)
+    
+    # 3. Características de ventana móvil (Ej: media/std de retornos recientes)
+    # NOTA: Usamos shift(1) para asegurarnos de que estas features solo usen datos conocidos ANTES del día actual.
+    df['rolling_mean_3'] = df['Actual'].shift(1).rolling(window=3).mean()
+    df['rolling_std_5'] = df['Actual'].shift(1).rolling(window=5).std()
+    
+    # Después de generar features, elimina las filas con NaN (las primeras filas por los lags/rollings)
+    df = df.dropna() 
+    return df
 
 # --- Helper Functions (Portfolio App - Fetch sin cambios) ---
 @st.cache_data(show_spinner="Fetching historical portfolio price data...")
@@ -247,6 +352,46 @@ def calculate_portfolio_performance(prices_df, weights_dict):
         st.error(traceback.format_exc())
         return None, None, renormalized_info
 
+# --- NUEVAS FUNCIONES PARA GESTIÓN DE RIESGO ---
+def calculate_var(returns, confidence_level=0.95):
+    """Calculates Value at Risk (VaR) using Historical and Parametric methods."""
+    if returns is None or returns.empty or len(returns) < 10: # Require a few points
+        return None, None
+    
+    # Historical VaR: Returns the loss as a positive fractional number
+    hist_var = -1 * returns.quantile(1 - confidence_level)
+
+    # Parametric VaR (Variance-Covariance): Assumes a normal distribution of returns.
+    mean = returns.mean()
+    std_dev = returns.std()
+    # Z-score for the left tail. e.g., for 95% confidence, we want the 5th percentile, ppf(0.05) = -1.645
+    z_score_ppf = norm.ppf(1 - confidence_level)
+    # The return at that percentile is mu + z*sigma. The loss is its negative.
+    para_var = -(mean + z_score_ppf * std_dev)
+
+    return hist_var, para_var
+
+def calculate_drawdowns(cumulative_returns_series):
+    """Calculates the drawdown series and max drawdown."""
+    if cumulative_returns_series is None or cumulative_returns_series.empty:
+        return None, 0, None
+    
+    # 1. Calculate the running maximum (previous high water mark)
+    running_max = cumulative_returns_series.cummax()
+    
+    # 2. Calculate the drawdown as the percentage drop from the running max
+    drawdown = (cumulative_returns_series - running_max) / running_max
+    
+    # 3. Calculate max drawdown
+    max_drawdown = drawdown.min()
+    
+    # 4. Find the date of the max drawdown
+    max_drawdown_date = drawdown.idxmin() if pd.notna(max_drawdown) and not drawdown.empty else None
+    
+    # CORRECCIÓN: Usar max_drawdown_date en lugar de max_dd_date
+    return drawdown, max_drawdown, max_drawdown_date
+
+
 # --- FUNCIONES PARA CARGAR/GUARDAR PORTAFOLIOS (Sin cambios) ---
 def load_portfolios_from_file():
     if os.path.exists(PORTFOLIO_FILE):
@@ -263,12 +408,24 @@ def load_portfolios_from_file():
             return {}
     return {}
 
+# Reemplaza tu función original con esta
 def save_portfolios_to_file(portfolios_dict):
+    """Guarda el diccionario de portafolios en el archivo JSON.
+    
+    Returns:
+        tuple[bool, str]: Un tuple con (True, "") en caso de éxito, 
+                          o (False, "mensaje de error") en caso de fallo.
+    """
     try:
         with open(PORTFOLIO_FILE, 'w') as f:
             json.dump(portfolios_dict, f, indent=4)
+        return True, "" # Éxito
     except Exception as e:
-        st.sidebar.error(f"Error al guardar portafolios en {PORTFOLIO_FILE}: {e}")
+        error_message = f"Error al guardar portafolios en {PORTFOLIO_FILE}: {e}"
+        # También imprime el error en la terminal para depuración
+        print(error_message) 
+        traceback.print_exc()
+        return False, error_message # Fallo
 
 
 # --- Funciones para InvertirOnline API ---
@@ -371,14 +528,14 @@ def parse_tickers_from_text(text_data):
                 })
     return all_tickers_info
 
-# --- Page Definition Functions (Forecasting App - Sin cambios) ---
+# --- Page Definition Functions (Forecasting App - Modificado) ---
 def main_page():
     st.header("Welcome!")
     st.markdown("""
-    This application provides tools for **portfolio management**, **individual stock forecasting**, **conceptual event analysis**, and **InvertirOnline API interaction**.
+    This application provides tools for **portfolio management**, **risk management**, **individual stock forecasting**, **conceptual event analysis**, and **InvertirOnline API interaction**.
     (Descripción de workflows sin cambios, solo se actualiza la mención a la API de IOL)
     """)
-# ... (resto de tus funciones de página de forecasting sin cambios: data_visualization, decomposition, optimal_lags, forecast_models) ...
+# ... (resto de tus funciones de página de forecasting sin cambios: data_visualization, decomposition, optimal_lags) ...
 def data_visualization():
     st.header("Data Visualization (Single Stock)")
     if 'entities' not in st.session_state or not st.session_state.entities:
@@ -559,8 +716,15 @@ def forecast_models():
     exog_help_text = "Include Lagged Squared Value (proxy for volatility) as predictor? (Actual.shift(1)**2)"
     with col_exog: use_exog = st.checkbox("Use Lagged Squared Value as Exogenous?", True, key="use_exog", help=exog_help_text)
 
+    # --- NUEVO SLIDER PARA ML FEATURES ---
+    if xgb_installed or lgbm_installed:
+        lag_features = st.slider("Max Lags for ML Models (XGB/LGBM)", 1, 30, 5, key="ml_max_lags", 
+                                 help="Maximum number of historical days (lags) to use as features for XGBoost and LightGBM.")
+    else:
+        lag_features = 5 # Default value if libraries are missing
+
     st.markdown("---"); st.subheader("Model Specific Parameters")
-    col_arima, col_ets, col_prophet = st.columns(3)
+    col_arima, col_ets, col_prophet, col_tbats = st.columns(4)
     with col_arima:
          st.markdown("**ARIMA/SARIMAX**");
          m_seasonal = st.number_input("Seasonal Period (m - days)", 1, 365, 1, 1, key='arima_m_seasonal',
@@ -578,6 +742,22 @@ def forecast_models():
         if prophet_growth == 'logistic':
              st.caption("Logistic growth requires defining capacity ('cap'). Using linear.")
              prophet_growth = 'linear'
+             
+    with col_tbats:
+        st.markdown("**TBATS**")
+        tbats_periods_str = st.text_input(
+            "Seasonal Periods", 
+            "5, 21", 
+            key="tbats_periods",
+            help="Comma-separated seasonal periods (e.g., 5 for weekly, 21 for monthly trading days)."
+        )
+        try:
+            seasonal_periods_tbats = [int(p.strip()) for p in tbats_periods_str.split(',') if p.strip().isdigit()]
+            if not seasonal_periods_tbats:
+                st.warning("No valid seasonal periods entered for TBATS.")
+        except:
+            st.error("Invalid format for TBATS seasonal periods. Use comma-separated numbers.")
+            seasonal_periods_tbats = []
 
     test_data = full_series.iloc[-m_future:]
     train_end_index_pos = len(full_series) - m_future
@@ -597,31 +777,79 @@ def forecast_models():
         except Exception as e: st.error(f"Could not generate future prediction dates: {e}. Cannot proceed."); return
     else: st.error("Cannot generate future prediction dates (test data empty, invalid end date, or missing frequency). Cannot proceed."); return
 
+    # --- PREPARACIÓN DE VARIABLE EXÓGENA (para modelos de TS y VAR/ML) ---
     if use_exog:
         with st.spinner("Preparing exogenous variable..."):
             try:
                 full_series_lagged = full_series.shift(1)
                 full_series_exog_sq = (full_series_lagged**2).rename(exog_name)
-                train_data_exog_prep = full_series_exog_sq.reindex(train_data.index).fillna(method='bfill').fillna(method='ffill').fillna(0)
-                test_data_exog_prep = full_series_exog_sq.reindex(test_data.index).fillna(method='bfill').fillna(method='ffill').fillna(0)
+                
+                # Slicing the training part
+                train_data_exog_prep = full_series_exog_sq.reindex(train_data.index).ffill().bfill().fillna(0)
+                
+                # Slicing the test part (for prediction)
+                test_data_exog_prep = full_series_exog_sq.reindex(test_data.index).ffill().bfill().fillna(0)
+                
+                # Future part (assuming last known actual value squared for m_future steps)
                 last_known_actual_value = test_data.iloc[-1] if not test_data.empty else train_data.iloc[-1]
                 future_exog_list = [(last_known_actual_value**2)] * m_future
                 future_exog_prep = pd.Series(future_exog_list, index=future_prediction_dates, name=exog_name)
+                
                 combined_exog_for_prediction_prep = pd.concat([test_data_exog_prep, future_exog_prep])
-                final_train_exog_clean = train_data_exog_prep.reindex(train_data.index)
+                
+                final_train_exog_clean = train_data_exog_prep.reindex(train_data.index).fillna(0)
                 full_pred_index = test_data.index.union(future_prediction_dates)
-                combined_exog_clean = combined_exog_for_prediction_prep.reindex(full_pred_index)
-                nan_in_train_exog = final_train_exog_clean.isnull().any()
-                nan_in_pred_exog = combined_exog_clean.isnull().any()
-                if nan_in_train_exog or nan_in_pred_exog:
-                     st.warning(f"NaNs detected in exogenous variable after processing (Train: {nan_in_train_exog}, Pred: {nan_in_pred_exog}). Attempting to fill with 0.")
-                     if final_train_exog_clean is not None: final_train_exog_clean = final_train_exog_clean.fillna(0)
-                     if combined_exog_clean is not None: combined_exog_clean = combined_exog_clean.fillna(0)
+                combined_exog_clean = combined_exog_for_prediction_prep.reindex(full_pred_index).fillna(0)
+                
+                if final_train_exog_clean.isnull().any() or combined_exog_clean.isnull().any():
+                     st.warning("NaNs detected in exogenous variable after processing. Filling with 0.")
                 st.caption("Exogenous variable prepared.")
             except Exception as e:
                  st.error(f"Failed to create exogenous variable: {e}")
                  use_exog = False; final_train_exog_clean = None; combined_exog_clean = None
                  st.warning("Proceeding without exogenous variable due to error.")
+
+    # --- PREPARACIÓN DE DATOS PARA MODELOS ML (XGBoost/LightGBM) ---
+    y_full, X_full = pd.Series(dtype=float), pd.DataFrame()
+    X_train_ml, y_train_ml, X_test_ml, y_test_ml = [None] * 4
+    
+    if xgb_installed or lgbm_installed:
+        with st.spinner(f"Generating time series features (lags={lag_features}) for ML models..."):
+            full_df_ml = full_series.to_frame(name='Actual')
+            
+            # Incorporate Exogenous feature into ML DataFrame if requested
+            if use_exog and final_train_exog_clean is not None and combined_exog_clean is not None:
+                # Usamos solo la parte histórica para generar lags, la parte futura se genera en el bootstrapping
+                full_exog_historical = final_train_exog_clean.reindex(full_series.index)
+                full_df_ml[exog_name] = full_exog_historical
+                
+            full_df_ml_features = create_ts_features(full_df_ml, lag_max=lag_features) 
+
+            # Split into X and y for ML
+            if 'Actual' in full_df_ml_features.columns:
+                y_full = full_df_ml_features['Actual']
+                X_full = full_df_ml_features.drop(columns=['Actual'])
+            
+            # Update train/test splits based on the new featured data indices
+            train_indices_ml = train_data.index.intersection(y_full.index)
+            test_indices_ml = test_data.index.intersection(y_full.index)
+            
+            if not y_full.empty and not train_indices_ml.empty and not test_indices_ml.empty:
+                y_train_ml = y_full.loc[train_indices_ml]
+                X_train_ml = X_full.loc[train_indices_ml]
+                y_test_ml = y_full.loc[test_indices_ml]
+                X_test_ml = X_full.loc[test_indices_ml]
+                st.caption(f"ML Train Data Size: {len(y_train_ml)} (Loss of {len(train_data) - len(y_train_ml)} pts due to lags/rollings)")
+            else:
+                 st.warning("ML models skipped: Not enough data remaining after feature engineering (lags/rollings).")
+
+    # --- MODEL LIST FOR CV ---
+    model_names_cv = ["ARIMA", "ARIMAX", "SARIMAX", "ETS", "VAR", "TBATS"]
+    if prophet_installed: model_names_cv.append("Prophet")
+    # Solo añadimos modelos ML si tenemos datos suficientes para entrenamiento (y_train_ml)
+    if xgb_installed and y_train_ml is not None and not y_train_ml.empty: model_names_cv.append("XGBoost")
+    if lgbm_installed and y_train_ml is not None and not y_train_ml.empty: model_names_cv.append("LightGBM")
+
 
     st.markdown("---"); st.subheader("Time Series Cross-Validation")
     cv_test_size = max(5, m_future // 2 if m_future > 1 else 1)
@@ -637,9 +865,6 @@ def forecast_models():
         if actual_cv_splits < 2: st.error(f"Cannot perform CV with < 2 splits ({actual_cv_splits} available). Increase training data or decrease CV splits/test size."); return
     except ValueError as e: st.error(f"Failed to create TimeSeriesSplit: {e}."); return
 
-    model_names_cv = ["ARIMA", "ARIMAX", "SARIMAX", "ETS", "VAR"]
-    if prophet_installed: model_names_cv.append("Prophet")
-
     all_rmse_scores = {name: [] for name in model_names_cv}
     progress_bar_cv = st.progress(0); cv_message = st.empty()
     split_data_cv = train_data; split_exog_cv = final_train_exog_clean
@@ -652,27 +877,73 @@ def forecast_models():
             st.caption(f"CV Split {cv_split_count}/{actual_cv_splits}: Skipped (empty validation set).")
             [all_rmse_scores[name].append(np.nan) for name in model_names_cv]
             continue
+        
+        # --- PREPARACIÓN DE EXÓGENAS PARA MODELOS TS/VAR/PROPHET ---
         cv_train_exog, cv_val_exog = None, None
         prophet_cv_exog_ready = False
         if use_exog and split_exog_cv is not None and not split_exog_cv.empty:
              try:
                  temp_train_exog = split_exog_cv.iloc[train_idx].reindex(cv_train.index)
                  temp_val_exog = split_exog_cv.iloc[val_idx].reindex(cv_val.index)
-                 temp_train_exog = temp_train_exog.fillna(method='ffill').fillna(method='bfill').fillna(0)
-                 temp_val_exog = temp_val_exog.fillna(method='ffill').fillna(method='bfill').fillna(0)
+                 
+                 # CORRECCIÓN DE DEPRECACIÓN DE PANDAS: Usar ffill() y bfill() en lugar de fillna(method=...)
+                 temp_train_exog = temp_train_exog.ffill().bfill().fillna(0)
+                 temp_val_exog = temp_val_exog.ffill().bfill().fillna(0)
+                 
                  if not temp_train_exog.isnull().any() and not temp_val_exog.isnull().any():
                       cv_train_exog, cv_val_exog = temp_train_exog, temp_val_exog
                       prophet_cv_exog_ready = True
                  else: st.caption(f"CV Split {cv_split_count}: NaN found in Exog, some models skipped.")
-             except Exception as e_exog_cv: st.caption(f"CV Split {cv_split_count}: Error slicing Exog ({e_exog_cv}), some models skipped.")
+             except Exception as e_exog_cv: st.caption(f"CV Split {cv_split_count}: Error slicing Exog ({e_exog_cv}). Some models skipped.")
+        
+        # --- PREPARACIÓN DE FEATURES PARA MODELOS ML (XGB/LGBM) ---
+        X_cv_train_ml, y_cv_train_ml, X_cv_val_ml, y_cv_val_ml = None, None, None, None
+        if "XGBoost" in model_names_cv or "LightGBM" in model_names_cv:
+            try:
+                # Obtenemos los datos necesarios para generar lags, incluyendo las filas anteriores al tren
+                # Esto es crucial para que los lags en el inicio del cv_train sean correctos.
+                min_cv_idx = train_idx.min() - lag_features 
+                # Asegura que el slice no vaya antes del inicio de train_data
+                start_ml_slice = max(0, min_cv_idx)
+                
+                # Usamos el split_data_cv original (solo Actual) y añadimos exógena si está
+                cv_df_raw = split_data_cv.iloc[start_ml_slice:val_idx.max()].to_frame(name='Actual')
+                
+                # Añadir exógena si está siendo usada
+                if use_exog and split_exog_cv is not None:
+                    # sliced_exog_cv incluye historial pre-train
+                    sliced_exog_cv = split_exog_cv.iloc[start_ml_slice:val_idx.max()]
+                    cv_df_raw[exog_name] = sliced_exog_cv.reindex(cv_df_raw.index).fillna(0)
+                
+                cv_features = create_ts_features(cv_df_raw, lag_max=lag_features)
+
+                # Re-split based on feature indices (only use the indices that actually ended up in cv_train and cv_val)
+                cv_train_ml_indices = cv_train.index.intersection(cv_features.index)
+                cv_val_ml_indices = cv_val.index.intersection(cv_features.index)
+                
+                if not cv_train_ml_indices.empty and not cv_val_ml_indices.empty:
+                    y_cv_train_ml = cv_features.loc[cv_train_ml_indices, 'Actual']
+                    X_cv_train_ml = cv_features.loc[cv_train_ml_indices].drop(columns=['Actual'])
+                    y_cv_val_ml = cv_features.loc[cv_val_ml_indices, 'Actual']
+                    X_cv_val_ml = cv_features.loc[cv_val_ml_indices].drop(columns=['Actual'])
+                else:
+                    # Esto puede ocurrir si el conjunto de validación es demasiado pequeño después de los lags
+                    raise ValueError("Insufficient data remaining after lag generation for ML CV split.")
+            
+            except Exception as e_ml_cv:
+                st.caption(f"CV Split {cv_split_count}: Error preparing ML features ({e_ml_cv}). ML models skipped.")
+
         progress_text = f"Running CV Split {cv_split_count}/{actual_cv_splits}..."; progress_bar_cv.progress(cv_split_count / actual_cv_splits); cv_message.text(progress_text)
         min_cv_train_len = max(15, 2 * m_seasonal if m_seasonal > 1 else 15)
+        
         if len(cv_train) < min_cv_train_len:
             st.caption(f"CV Split {cv_split_count}: Skipped (training data < {min_cv_train_len}).")
             [all_rmse_scores[name].append(np.nan) for name in model_names_cv]
             continue
+        
         order_cv, seasonal_order_cv = (1,0,0), (0,0,0,0)
-        # ran_auto_arima_cv = False # No se usa explicitamente
+        
+        # --- ARIMA / SARIMAX Parameter Selection ---
         if any(m in model_names_cv for m in ["ARIMA", "ARIMAX", "SARIMAX"]):
             try:
                 cv_seasonal_flag = (m_seasonal > 1) and (len(cv_train) >= 2 * m_seasonal)
@@ -684,15 +955,18 @@ def forecast_models():
                                                 suppress_warnings=True, error_action='ignore', stepwise=True, information_criterion='aic', n_jobs=1,
                                                 max_p=5, max_q=5, max_P=2, max_Q=2)
                     order_cv, seasonal_order_cv = model_auto_cv.order, model_auto_cv.seasonal_order
-                    # ran_auto_arima_cv = True # No se usa explicitamente
                 else: st.caption(f"CV Split {cv_split_count}: AutoARIMA skipped (too few obs). Using defaults.")
             except Exception as e_auto_cv: st.caption(f"CV Split {cv_split_count}: AutoARIMA failed ({e_auto_cv}). Using defaults.")
+        
+        # --- ARIMA ---
         if "ARIMA" in model_names_cv:
             try:
                 model=ARIMA(cv_train,order=order_cv).fit()
                 pred=model.predict(start=cv_val.index[0],end=cv_val.index[-1])
                 all_rmse_scores["ARIMA"].append(np.sqrt(mean_squared_error(cv_val,pred)))
             except Exception: all_rmse_scores["ARIMA"].append(np.nan)
+        
+        # --- ARIMAX ---
         if "ARIMAX" in model_names_cv:
             if use_exog and cv_train_exog is not None and cv_val_exog is not None:
                 try:
@@ -701,6 +975,8 @@ def forecast_models():
                     all_rmse_scores["ARIMAX"].append(np.sqrt(mean_squared_error(cv_val,pred)))
                 except Exception: all_rmse_scores["ARIMAX"].append(np.nan)
             else: all_rmse_scores["ARIMAX"].append(np.nan)
+            
+        # --- SARIMAX ---
         if "SARIMAX" in model_names_cv:
             try:
                 s_order = list(seasonal_order_cv);
@@ -711,6 +987,8 @@ def forecast_models():
                 pred=model.predict(start=cv_val.index[0],end=cv_val.index[-1],exog=cv_val_exog if use_exog else None)
                 all_rmse_scores["SARIMAX"].append(np.sqrt(mean_squared_error(cv_val,pred)))
             except Exception: all_rmse_scores["SARIMAX"].append(np.nan)
+        
+        # --- ETS ---
         if "ETS" in model_names_cv:
             try:
                 ets_s_cv, ets_t_cv = seasonal_ets, trend_ets
@@ -723,6 +1001,8 @@ def forecast_models():
                 pred=model.predict(start=cv_val.index[0],end=cv_val.index[-1])
                 all_rmse_scores["ETS"].append(np.sqrt(mean_squared_error(cv_val,pred)))
             except Exception: all_rmse_scores["ETS"].append(np.nan)
+            
+        # --- VAR ---
         if "VAR" in model_names_cv:
             if use_exog and cv_train_exog is not None and cv_val_exog is not None:
                  try:
@@ -744,6 +1024,27 @@ def forecast_models():
                      else: all_rmse_scores["VAR"].append(np.nan) # No suficientes datos para VAR
                  except Exception as e_var_cv: all_rmse_scores["VAR"].append(np.nan); st.caption(f"VAR CV Error (Split {cv_split_count}): {e_var_cv}")
             else: all_rmse_scores["VAR"].append(np.nan) # VAR requiere exógena en esta configuración
+        
+        # --- TBATS ---
+        if "TBATS" in model_names_cv:
+            if tbats_installed and seasonal_periods_tbats:
+                try:
+                    # Filtra periodos que son demasiado grandes para los datos de entrenamiento del CV
+                    valid_cv_periods = [p for p in seasonal_periods_tbats if len(cv_train) > 2 * p]
+                    if valid_cv_periods:
+                        estimator = TBATS(seasonal_periods=valid_cv_periods, use_arma_errors=False, n_jobs=1)
+                        model = estimator.fit(cv_train)
+                        pred = model.forecast(steps=len(cv_val))
+                        all_rmse_scores["TBATS"].append(np.sqrt(mean_squared_error(cv_val, pred)))
+                    else:
+                        all_rmse_scores["TBATS"].append(np.nan)
+                except Exception as e_tbats_cv:
+                    st.caption(f"TBATS CV failed on split {cv_split_count}: {e_tbats_cv}")
+                    all_rmse_scores["TBATS"].append(np.nan)
+            else:
+                all_rmse_scores["TBATS"].append(np.nan)    
+        
+        # --- Prophet ---
         if "Prophet" in model_names_cv:
             if prophet_installed:
                 try:
@@ -762,6 +1063,34 @@ def forecast_models():
                     all_rmse_scores["Prophet"].append(np.sqrt(mean_squared_error(cv_val, pred)))
                 except Exception as e_prophet_cv: st.caption(f"Prophet CV failed on split {cv_split_count}: {e_prophet_cv}"); all_rmse_scores["Prophet"].append(np.nan)
             else: all_rmse_scores["Prophet"].append(np.nan)
+            
+        # --- XGBoost ---
+        if "XGBoost" in model_names_cv:
+            if xgb_installed and X_cv_train_ml is not None and not X_cv_train_ml.empty:
+                try:
+                    model = xgb.XGBRegressor(n_estimators=100, objective='reg:squarederror', random_state=42)
+                    model.fit(X_cv_train_ml, y_cv_train_ml)
+                    pred = model.predict(X_cv_val_ml)
+                    all_rmse_scores["XGBoost"].append(np.sqrt(mean_squared_error(y_cv_val_ml, pred)))
+                except Exception as e_xgb_cv:
+                    st.caption(f"XGBoost CV failed on split {cv_split_count}: {e_xgb_cv}")
+                    all_rmse_scores["XGBoost"].append(np.nan)
+            else:
+                all_rmse_scores["XGBoost"].append(np.nan)
+        
+        # --- LightGBM ---
+        if "LightGBM" in model_names_cv:
+            if lgbm_installed and X_cv_train_ml is not None and not X_cv_train_ml.empty:
+                try:
+                    model = lgb.LGBMRegressor(n_estimators=100, random_state=42)
+                    model.fit(X_cv_train_ml, y_cv_train_ml)
+                    pred = model.predict(X_cv_val_ml)
+                    all_rmse_scores["LightGBM"].append(np.sqrt(mean_squared_error(y_cv_val_ml, pred)))
+                except Exception as e_lgbm_cv:
+                    st.caption(f"LightGBM CV failed on split {cv_split_count}: {e_lgbm_cv}")
+                    all_rmse_scores["LightGBM"].append(np.nan)
+            else:
+                all_rmse_scores["LightGBM"].append(np.nan)
 
     progress_bar_cv.empty(); cv_message.empty()
     results_cv = {name: np.nanmean([s for s in scores if pd.notna(s)]) for name, scores in all_rmse_scores.items()}
@@ -796,6 +1125,7 @@ def forecast_models():
     if test_data.empty or future_prediction_dates is None: st.error("Cannot fit final models: Test data or future dates are invalid."); return
     full_prediction_index = test_data.index.union(future_prediction_dates)
 
+    # --- FINAL ARIMA/SARIMAX/ETS/VAR/TBATS/PROPHET FITTING (Existente) ---
     if "ARIMA" in model_names_cv:
         with st.spinner("Fitting ARIMA..."):
             try:
@@ -921,24 +1251,221 @@ def forecast_models():
                     model_residuals['Prophet'] = pd.Series(residuals_prophet, index=train_data.index)
                 except Exception as e: st.warning(f"Prophet failed: {e}"); [d.pop('Prophet', None) for d in [test_predictions, future_predictions, final_models, model_residuals]]
         else: st.warning("Prophet model skipped because the 'prophet' library is not installed.")
+    
+    
+    if "TBATS" in model_names_cv:
+        if tbats_installed and seasonal_periods_tbats:
+            with st.spinner("Fitting TBATS..."):
+                try:
+                    # Asegúrate de que los periodos no sean demasiado grandes para el conjunto de entrenamiento final
+                    valid_final_periods = [p for p in seasonal_periods_tbats if len(train_data) > 2 * p]
+                    if not valid_final_periods:
+                        st.warning(f"TBATS skipped: Training data ({len(train_data)}) too small for specified seasonal periods: {seasonal_periods_tbats}")
+                    else:
+                        estimator = TBATS(seasonal_periods=valid_final_periods, use_arma_errors=False, n_jobs=1)
+                        model = estimator.fit(train_data)
+                        final_models['TBATS'] = model
+                        
+                        # Predecir para el conjunto de test y el futuro
+                        preds_tbats = model.forecast(steps=n_total_preds)
+                        preds_ser = pd.Series(preds_tbats, index=full_prediction_index)
+
+                        test_predictions['TBATS'] = preds_ser.reindex(test_data.index)
+                        future_predictions['TBATS'] = preds_ser.reindex(future_prediction_dates)
+                        
+                        # Calcular residuos (y_hat son las predicciones in-sample)
+                        if hasattr(model, 'y_hat'):
+                           residuals_tbats = train_data - pd.Series(model.y_hat, index=train_data.index)
+                           model_residuals['TBATS'] = residuals_tbats.reindex(train_data.index)
+
+                except Exception as e:
+                    st.warning(f"TBATS failed: {e}")
+                    # Limpiar en caso de error
+                    [d.pop('TBATS', None) for d in [test_predictions, future_predictions, final_models, model_residuals]]
+        elif tbats_installed:
+            st.warning("TBATS skipped: No valid seasonal periods were configured.")
+        else:
+            st.warning("TBATS skipped because the 'tbats' library is not installed.")
+
+    # --- NUEVOS: FINAL XGBOOST FITTING ---
+    if "XGBoost" in model_names_cv and xgb_installed and X_train_ml is not None and not X_train_ml.empty:
+        with st.spinner("Fitting XGBoost..."):
+            try:
+                model = xgb.XGBRegressor(n_estimators=150, objective='reg:squarederror', random_state=42, n_jobs=1)
+                model.fit(X_train_ml, y_train_ml)
+                final_models['XGBoost'] = model
+                
+                # Predict Test Set (simple)
+                test_preds = model.predict(X_test_ml)
+                test_predictions['XGBoost'] = pd.Series(test_preds, index=X_test_ml.index)
+                
+                # Predict Future (Bootstrapping required)
+                
+                # FIX: Create template DataFrame for future prediction dates
+                X_future_ml_xgb = pd.DataFrame(index=future_prediction_dates, columns=X_train_ml.columns).fillna(0)
+
+                # Populate fixed time features for the future
+                X_future_ml_xgb['dayofweek'] = X_future_ml_xgb.index.dayofweek
+                X_future_ml_xgb['quarter'] = X_future_ml_xgb.index.quarter
+                X_future_ml_xgb['month'] = X_future_ml_xgb.index.month
+                X_future_ml_xgb['year'] = X_future_ml_xgb.index.year
+                X_future_ml_xgb['dayofyear'] = X_future_ml_xgb.index.dayofyear
+                
+                # Populate initial lags using the last N historical observations (from y_full)
+                # Usamos y_full porque contiene los valores reales después de la generación de features
+                initial_lags_series = y_full.tail(lag_features).values[::-1] # Last actual values, reversed (index 0 is lag_1)
+                
+                # Also initialize rolling features in the first future step (simplification: last known rolling value)
+                rolling_cols = [c for c in X_train_ml.columns if c.startswith('rolling_')]
+                if rolling_cols and not X_test_ml.empty:
+                    last_known_X = X_test_ml.iloc[-1]
+                    for col in rolling_cols:
+                        if col in last_known_X.index and col in X_future_ml_xgb.columns:
+                            X_future_ml_xgb.loc[X_future_ml_xgb.index[0], col] = last_known_X[col]
+                            
+                # Set initial lag features for the FIRST future step (t=0)
+                if not X_future_ml_xgb.empty:
+                    for lag_idx in range(1, lag_features + 1):
+                        col_name = f'lag_{lag_idx}'
+                        if col_name in X_future_ml_xgb.columns:
+                            if lag_idx <= len(initial_lags_series):
+                                X_future_ml_xgb.loc[X_future_ml_xgb.index[0], col_name] = initial_lags_series[lag_idx - 1]
+                            else:
+                                X_future_ml_xgb.loc[X_future_ml_xgb.index[0], col_name] = 0 
+                
+                # Iterative prediction for the future m_future steps
+                future_preds = []
+                for t in range(m_future):
+                    X_step = X_future_ml_xgb.iloc[t:t+1]
+                    pred_step = model.predict(X_step)[0]
+                    future_preds.append(pred_step)
+                    
+                    # Update lags for the next step (t+1) using the prediction
+                    if t < m_future - 1:
+                        # 1. Shift existing lags forward
+                        for lag in range(lag_features, 1, -1):
+                            lag_col_current = f'lag_{lag}'
+                            lag_col_previous = f'lag_{lag-1}'
+                            if lag_col_current in X_future_ml_xgb.columns and lag_col_previous in X_future_ml_xgb.columns:
+                                X_future_ml_xgb.loc[X_future_ml_xgb.index[t+1], lag_col_current] = X_future_ml_xgb.loc[X_future_ml_xgb.index[t], lag_col_previous]
+                        
+                        # 2. Set lag_1 to the predicted value
+                        if 'lag_1' in X_future_ml_xgb.columns:
+                           X_future_ml_xgb.loc[X_future_ml_xgb.index[t+1], 'lag_1'] = pred_step
+                        
+                        # 3. If exog is based on lag_1 squared, update that too
+                        if use_exog and exog_name in X_future_ml_xgb.columns:
+                            X_future_ml_xgb.loc[X_future_ml_xgb.index[t+1], exog_name] = pred_step**2
+                            
+                        # 4. NOTE: Rolling features are complex to update iteratively (they rely on a mean/std of N past steps), 
+                        # so we leave them set to the initial estimate or 0, which is a common simplification in ML time series bootstrapping.
+                            
+                future_predictions['XGBoost'] = pd.Series(future_preds, index=future_prediction_dates)
+                model_residuals['XGBoost'] = pd.Series(y_train_ml.values - model.predict(X_train_ml), index=y_train_ml.index)
+                
+            except Exception as e:
+                st.warning(f"XGBoost failed: {e}")
+                [d.pop('XGBoost', None) for d in [test_predictions, future_predictions, final_models, model_residuals]]
+        
+    # --- NUEVOS: FINAL LIGHTGBM FITTING ---
+    if "LightGBM" in model_names_cv and lgbm_installed and X_train_ml is not None and not X_train_ml.empty:
+        with st.spinner("Fitting LightGBM..."):
+             try:
+                 model = lgb.LGBMRegressor(n_estimators=150, random_state=42, n_jobs=1)
+                 model.fit(X_train_ml, y_train_ml)
+                 final_models['LightGBM'] = model
+                 
+                 # Predict Test Set (simple)
+                 test_preds = model.predict(X_test_ml)
+                 test_predictions['LightGBM'] = pd.Series(test_preds, index=X_test_ml.index)
+
+                 # Predict Future (Bootstrapping required) - Reusing logic setup for XGBoost
+                 # FIX: Create template DataFrame for future prediction dates
+                 X_future_ml_lgbm = pd.DataFrame(index=future_prediction_dates, columns=X_train_ml.columns).fillna(0)
+
+                 # Populate fixed time features for the future
+                 X_future_ml_lgbm['dayofweek'] = X_future_ml_lgbm.index.dayofweek
+                 X_future_ml_lgbm['quarter'] = X_future_ml_lgbm.index.quarter
+                 X_future_ml_lgbm['month'] = X_future_ml_lgbm.index.month
+                 X_future_ml_lgbm['year'] = X_future_ml_lgbm.index.year
+                 X_future_ml_lgbm['dayofyear'] = X_future_ml_lgbm.index.dayofyear
+
+                 # Initialize rolling features in the first future step (simplification: last known rolling value)
+                 if rolling_cols and not X_test_ml.empty:
+                    last_known_X = X_test_ml.iloc[-1]
+                    for col in rolling_cols:
+                        if col in last_known_X.index and col in X_future_ml_lgbm.columns:
+                            X_future_ml_lgbm.loc[X_future_ml_lgbm.index[0], col] = last_known_X[col]
+                            
+                 # 1. Populate initial lags for the first future step 
+                 if not X_future_ml_lgbm.empty:
+                    for lag_idx in range(1, lag_features + 1):
+                        col_name = f'lag_{lag_idx}'
+                        if col_name in X_future_ml_lgbm.columns:
+                            if lag_idx <= len(initial_lags_series):
+                                X_future_ml_lgbm.loc[X_future_ml_lgbm.index[0], col_name] = initial_lags_series[lag_idx - 1]
+                            else:
+                                X_future_ml_lgbm.loc[X_future_ml_lgbm.index[0], col_name] = 0 
+
+
+                 future_preds_lgbm = []
+                 for t in range(m_future):
+                     X_step = X_future_ml_lgbm.iloc[t:t+1]
+                     pred_step = model.predict(X_step)[0]
+                     future_preds_lgbm.append(pred_step)
+
+                     if t < m_future - 1:
+                         # 1. Shift lags forward
+                         for lag in range(lag_features, 1, -1):
+                             lag_col_current = f'lag_{lag}'
+                             lag_col_previous = f'lag_{lag-1}'
+                             if lag_col_current in X_future_ml_lgbm.columns and lag_col_previous in X_future_ml_lgbm.columns:
+                                X_future_ml_lgbm.loc[X_future_ml_lgbm.index[t+1], lag_col_current] = X_future_ml_lgbm.loc[X_future_ml_lgbm.index[t], lag_col_previous]
+                         
+                         # 2. Set lag_1 to the predicted value
+                         if 'lag_1' in X_future_ml_lgbm.columns:
+                            X_future_ml_lgbm.loc[X_future_ml_lgbm.index[t+1], 'lag_1'] = pred_step
+                         
+                         # 3. If exog is based on lag_1 squared, update that too
+                         if use_exog and exog_name in X_future_ml_lgbm.columns:
+                            X_future_ml_lgbm.loc[X_future_ml_lgbm.index[t+1], exog_name] = pred_step**2
+                            
+                 future_predictions['LightGBM'] = pd.Series(future_preds_lgbm, index=future_prediction_dates)
+                 model_residuals['LightGBM'] = pd.Series(y_train_ml.values - model.predict(X_train_ml), index=y_train_ml.index)
+                 
+             except Exception as e:
+                 st.warning(f"LightGBM failed: {e}")
+                 [d.pop('LightGBM', None) for d in [test_predictions, future_predictions, final_models, model_residuals]]
+    # --- END NEW ML FITTING ---
 
     st.markdown("---"); st.subheader("Test Set Performance & Future Forecast Visualization")
     fig_fc, ax_fc = plt.subplots(figsize=(14, 7))
     ax_fc.plot(train_data.index, train_data, label='Training Data', color='dimgray', lw=1, alpha=0.7)
-    ax_fc.plot(test_data.index, test_data, label=f'Actual Test ({data_type.capitalize()})', color='blue', marker='.', linestyle='-', ms=5)
-    colors = {'ARIMA':'#1f77b4','ARIMAX':'#ff7f0e','SARIMAX':'#2ca02c','ETS':'#d62728','VAR':'#9467bd', 'Prophet':'#8c564b'}
+    # Ajustar para que el test data plot solo use los puntos que realmente tienen features para ML, si es relevante
+    if X_test_ml is not None and not X_test_ml.empty:
+        test_data_actual = test_data.reindex(X_test_ml.index)
+    else:
+        test_data_actual = test_data
+        
+    ax_fc.plot(test_data_actual.index, test_data_actual, label=f'Actual Test ({data_type.capitalize()})', color='blue', marker='.', linestyle='-', ms=5)
+    
+    colors = {'ARIMA':'#1f77b4','ARIMAX':'#ff7f0e','SARIMAX':'#2ca02c','ETS':'#d62728','VAR':'#9467bd', 'Prophet':'#8c564b', 'TBATS':'#e377c2', 'XGBoost': '#17becf', 'LightGBM': '#bcbd22'}
     plot_successful = False
+    
     if test_predictions:
         for name, preds in test_predictions.items():
             if preds is not None and isinstance(preds, pd.Series) and not preds.empty:
-                preds_aligned = preds.reindex(test_data.index).dropna()
+                preds_aligned = preds.reindex(test_data_actual.index).dropna() # Usar test_data_actual index para ML models
                 if not preds_aligned.empty: ax_fc.plot(preds_aligned.index, preds_aligned, label=f'{name} Test', linestyle='--', color=colors.get(name, '#7f7f7f'), lw=1.5); plot_successful = True
+    
     if future_predictions:
         for name, preds in future_predictions.items():
              if preds is not None and isinstance(preds, pd.Series) and not preds.empty:
                  preds_aligned = preds.reindex(future_prediction_dates).dropna()
                  if not preds_aligned.empty: ax_fc.plot(preds_aligned.index, preds_aligned, label=f'{name} Fcst', linestyle=':', color=colors.get(name, '#7f7f7f'), lw=1.5); plot_successful = True
+    
     if not plot_successful: st.warning("No valid model predictions were generated to plot.")
+    
     ax_fc.set_title(f"Forecasts for {selected_entity_model} ({data_type.capitalize()})"); ax_fc.set_xlabel("Date"); ax_fc.set_ylabel(f"Daily {data_type.capitalize()}");
     ax_fc.legend(loc='center left', bbox_to_anchor=(1.02, 0.5)); ax_fc.grid(True,ls='--',lw=0.5);
     if not train_data.empty: ax_fc.axvline(train_data.index[-1], color='gray', linestyle=':', lw=2, label='_nolegend_');
@@ -947,10 +1474,12 @@ def forecast_models():
     st.subheader("Detailed Results: Test Performance & Future Forecast")
     results_df = pd.DataFrame()
     format_str = "{:,.4f}%" if data_type == 'returns' else "{:,.2f}"
-    if not test_data.empty and future_prediction_dates is not None:
-         combined_index = test_data.index.union(future_prediction_dates)
+    
+    # Usamos el índice ajustado para la columna Actual
+    if not test_data_actual.empty and future_prediction_dates is not None:
+         combined_index = test_data_actual.index.union(future_prediction_dates)
          results_df = pd.DataFrame(index=combined_index);
-         results_df['Actual'] = test_data.reindex(combined_index)
+         results_df['Actual'] = test_data_actual.reindex(combined_index)
          all_preds = {}
          for name, p in test_predictions.items():
              if p is not None: all_preds[f'{name}_Test'] = p
@@ -963,11 +1492,12 @@ def forecast_models():
 
     st.subheader(f"Forecast Accuracy (MAPE on Test Set - {data_type.capitalize()})")
     mape_res = {}; mape_df = pd.DataFrame()
-    if test_predictions and not test_data.empty:
+    if test_predictions and not test_data_actual.empty:
         for name, preds in test_predictions.items():
             if preds is not None and isinstance(preds, pd.Series):
-                 preds_aligned = preds.reindex(test_data.index).dropna()
-                 actuals_aligned = test_data.reindex(preds_aligned.index).dropna()
+                 # Aseguramos que la alineación se haga con el test_data_actual
+                 preds_aligned = preds.reindex(test_data_actual.index).dropna()
+                 actuals_aligned = test_data_actual.reindex(preds_aligned.index).dropna()
                  if not preds_aligned.empty and len(preds_aligned) == len(actuals_aligned):
                      try: mape_val = mape(actuals_aligned, preds_aligned); mape_res[name] = mape_val if pd.notna(mape_val) else np.nan
                      except Exception as e_mape: st.caption(f"MAPE calculation failed for {name}: {e_mape}"); mape_res[name] = np.nan
@@ -1005,7 +1535,12 @@ def forecast_models():
             return
         res_aligned = None
         if isinstance(residuals, pd.Series):
-             try: res_aligned = residuals.reindex(train_idx).dropna()
+             try: 
+                 # Ajuste de índice para los residuos de ML, que pueden ser más cortos
+                 if model_name in ["XGBoost", "LightGBM"]:
+                      res_aligned = residuals.reindex(y_train_ml.index).dropna()
+                 else:
+                      res_aligned = residuals.reindex(train_idx).dropna()
              except Exception: pass # Silenciar si falla el reindex
         if res_aligned is None or res_aligned.empty: st.warning(f"Could not align or find valid residuals for {model_name}."); return
         st.markdown(f"--- **{model_name} Residuals** ---")
@@ -1065,117 +1600,150 @@ def forecast_models():
 
 
 # --- Page Definition Functions (Portfolio App - Create/Edit) ---
+# --- PÁGINA "Create/Edit Portfolios" - VERSIÓN CON RENOMBRADO Y ELIMINACIÓN CORREGIDOS ---
+
 def page_create_portfolio():
     st.header("📈 Create or Edit Portfolios")
-    st.markdown("""
-    Define multiple portfolios by name, entering stock tickers and their weights.
-    **Important:**
-    *   Each portfolio's weights **must sum to 1.0** (or 100%).
-    *   Use official ticker symbols (e.g., **AAPL**, **MSFT**, **CEPU.BA**). Check spelling carefully.
-    *   Saving overwrites portfolios with the same name.
-    *   **Portfolios are saved to `portfolios_data.json` in the same directory as the script.**
-    """)
+
+    # Inicializar claves de estado necesarias para esta página si no existen
+    if 'delete_confirmation' not in st.session_state:
+        st.session_state.delete_confirmation = None
+    if 'portfolio_name_input' not in st.session_state:
+        st.session_state.portfolio_name_input = ""
+    if 'portfolio_tickers_input' not in st.session_state:
+        st.session_state.portfolio_tickers_input = ""
+    
+    def sync_form_to_selection():
+        # Función de callback que se ejecuta al cambiar la selección del dropdown.
+        # Su única misión es poblar el formulario con los datos del portafolio seleccionado.
+        st.session_state.delete_confirmation = None # Resetear confirmación de borrado
+        
+        selected = st.session_state.portfolio_select
+        if selected != "(Create New Portfolio)" and selected in st.session_state.portfolios:
+            # Sincronizar el nombre en el campo de texto editable
+            st.session_state.portfolio_name_input = selected
+            # Cargar los tickers y pesos en el área de texto
+            weights_data = st.session_state.portfolios[selected]
+            tickers_str = "\n".join(f"{ticker}: {weight:.4f}" for ticker, weight in weights_data.items())
+            st.session_state.portfolio_tickers_input = tickers_str
+        else:
+            # Limpiar campos si se va a crear uno nuevo
+            st.session_state.portfolio_name_input = ""
+            st.session_state.portfolio_tickers_input = ""
+
     portfolio_names = list(st.session_state.portfolios.keys())
     options = ["(Create New Portfolio)"] + sorted(portfolio_names)
-    col_select, col_name_input = st.columns([1, 2])
-    with col_select:
-        selected_portfolio_name = st.selectbox(
-            "Select Portfolio:", options, key="portfolio_select",
-            help="Choose a portfolio to edit or select '(Create New Portfolio)'"
-        )
-    current_name = ""
-    with col_name_input:
-        if selected_portfolio_name == "(Create New Portfolio)":
-            current_name = st.text_input("Enter Name for New Portfolio:", key="new_portfolio_name", placeholder="e.g., My Tech Stocks").strip()
-        else:
-            current_name = st.text_input("Portfolio Name (can be edited):", value=selected_portfolio_name, key="edit_portfolio_name").strip()
+    
+    st.selectbox("Select Portfolio to Edit, or Create New:", options, key="portfolio_select", on_change=sync_form_to_selection)
+
     st.markdown("---")
-    initial_tickers_str = ""
-    initial_weights = {}
-    if selected_portfolio_name != "(Create New Portfolio)" and selected_portfolio_name in st.session_state.portfolios:
-        initial_weights = st.session_state.portfolios[selected_portfolio_name]
-        initial_tickers_str = ", ".join(initial_weights.keys())
+
     col_form, col_display = st.columns([2, 1])
+
     with col_form:
-        if current_name: st.subheader(f"Define/Edit Assets & Weights for: '{current_name}'")
-        else:
-             st.subheader("Define Assets & Weights")
-             if selected_portfolio_name == "(Create New Portfolio)": st.warning("Please enter a name for the new portfolio.")
+        # La caja de texto del nombre AHORA es independiente y mantiene su propio estado
+        current_name = st.text_input("Portfolio Name:", key="portfolio_name_input").strip()
+
+        st.subheader(f"Define/Edit Assets & Weights for: '{current_name or '(no name)'}'")
+
+        ticker_input_str = st.text_area(
+            "Enter Assets (format: TICKER: WEIGHT, one per line or comma-separated):",
+            key="portfolio_tickers_input",
+            height=250,
+            help="Example:\nAAPL: 0.4\nMSFT: 0.6"
+        )
+        
+        # Parseo de los tickers y pesos en tiempo real para feedback del usuario
+        weights_parsed = {}
+        parse_errors = []
+        if ticker_input_str:
+            entries = re.split(r'[,\n]+', ticker_input_str)
+            for entry in entries:
+                if ':' in entry:
+                    parts = entry.split(':')
+                    ticker = parts[0].strip().upper()
+                    try:
+                        weight = float(parts[1].strip())
+                        if ticker and weight >= 0:
+                            weights_parsed[ticker] = weight
+                    except (ValueError, IndexError):
+                        if entry.strip(): parse_errors.append(f"Could not parse '{entry.strip()}'.")
+                elif entry.strip(): parse_errors.append(f"Missing ':' in '{entry.strip()}'.")
+        
+        for error in parse_errors: st.warning(error, icon="⚠️")
+
         with st.form("portfolio_form"):
-            ticker_input_str = st.text_area(
-                "Enter Tickers (comma or space separated)", value=initial_tickers_str,
-                help="e.g., AAPL, MSFT, GOOG. For BCBA use format: TICKER.BA (e.g. CEPU.BA)" )
-            tickers = []
-            if ticker_input_str: tickers = sorted([t.strip().upper() for t in re.split('[,\s]+', ticker_input_str) if t.strip()])
-            weights_input = {}
-            if tickers:
-                st.markdown("**Enter Weights (as decimals, e.g., 0.4 for 40%):**")
-                max_cols = 4; num_rows = (len(tickers) + max_cols - 1) // max_cols; idx = 0
-                for r in range(num_rows):
-                    weight_cols = st.columns(min(len(tickers) - idx, max_cols))
-                    for i in range(len(weight_cols)):
-                        if idx < len(tickers):
-                            ticker = tickers[idx]
-                            with weight_cols[i]:
-                                default_val = initial_weights.get(ticker, 0.0 if len(initial_weights)>0 else (1.0/len(tickers) if len(tickers)>0 else 0.0))
-                                weights_input[ticker] = st.number_input(
-                                    f"Wt {ticker}", min_value=0.0, max_value=1.0, value=float(default_val),
-                                    step=0.01, format="%.4f", key=f"weight_{current_name}_{ticker}" )
-                            idx += 1
-            else: st.info("Enter ticker symbols above to define weights.")
-            form_cols = st.columns(2)
-            with form_cols[0]: submitted_save = st.form_submit_button(f"💾 Save Portfolio '{current_name or '(Enter Name)'}'", use_container_width=True, type="primary" if current_name else "secondary")
-            with form_cols[1]: submitted_delete = st.form_submit_button(f"🗑️ Delete '{selected_portfolio_name}'", use_container_width=True, disabled=(selected_portfolio_name == "(Create New Portfolio)"))
+            total_weight = sum(weights_parsed.values())
+            st.caption(f"Parsed {len(weights_parsed)} assets. Current total weight: {total_weight:.4f}")
+
+            # --- Botones de Acción ---
+            save_col, delete_col = st.columns(2)
+            with save_col:
+                submitted_save = st.form_submit_button("💾 Save Portfolio", type="primary", use_container_width=True, disabled=not (current_name and weights_parsed))
+            with delete_col:
+                is_existing_portfolio = st.session_state.portfolio_select != "(Create New Portfolio)"
+                submitted_delete = st.form_submit_button(f"🗑️ Delete '{st.session_state.portfolio_select}'", use_container_width=True, disabled=not is_existing_portfolio)
+
+            # --- Lógica de Guardado (corregida) ---
             if submitted_save:
-                if not current_name: st.error("Please enter a portfolio name.")
-                elif selected_portfolio_name == "(Create New Portfolio)" and current_name in st.session_state.portfolios: st.error(f"A portfolio named '{current_name}' already exists.")
-                elif not tickers: st.error("Please enter at least one ticker symbol.")
-                elif not weights_input: st.error("Weights could not be determined.")
+                original_name = st.session_state.portfolio_select
+                is_renaming = is_existing_portfolio and current_name != original_name
+
+                # Validaciones
+                if not current_name:
+                    st.error("Portfolio name cannot be empty.")
+                elif not is_existing_portfolio and current_name in st.session_state.portfolios:
+                    st.error(f"A portfolio named '{current_name}' already exists.")
+                elif is_renaming and current_name in st.session_state.portfolios:
+                    st.error(f"Cannot rename to '{current_name}'. A portfolio with that name already exists.")
+                elif not np.isclose(total_weight, 1.0, atol=0.001):
+                    st.error(f"❌ Weights must sum to 1.0. Current sum is {total_weight:.4f}. Please adjust.")
                 else:
-                    filtered_weights = {t: w for t, w in weights_input.items() if t in tickers}
-                    total_weight = sum(filtered_weights.values())
-                    if not np.isclose(total_weight, 1.0, atol=0.001): st.warning(f"⚠️ Weights for '{current_name}' sum to {total_weight:.4f}, which is not close to 1.0. Please adjust.")
-                    else:
-                        final_weights = {t: max(0.0, w) for t, w in filtered_weights.items()}
-                        final_sum = sum(final_weights.values())
-                        if not np.isclose(final_sum, 1.0) and final_sum > 1e-6 : final_weights = {t: w / final_sum for t, w in final_weights.items()}
-                        renamed = False
-                        if selected_portfolio_name != "(Create New Portfolio)" and current_name != selected_portfolio_name:
-                             if current_name in st.session_state.portfolios: st.error(f"Cannot rename to '{current_name}' as another portfolio with that name already exists."); st.stop()
-                             else: del st.session_state.portfolios[selected_portfolio_name]; renamed = True
-                        st.session_state.portfolios[current_name] = final_weights
-                        save_portfolios_to_file(st.session_state.portfolios)
-                        if renamed: st.success(f"✅ Portfolio '{selected_portfolio_name}' successfully renamed and saved as '{current_name}'!")
-                        else: st.success(f"✅ Portfolio '{current_name}' saved successfully!")
-                        st.balloons(); st.rerun()
+                    # Acciones
+                    if is_renaming:
+                        del st.session_state.portfolios[original_name]
+                    
+                    normalized_weights = {t: w / total_weight for t, w in weights_parsed.items()}
+                    st.session_state.portfolios[current_name] = normalized_weights
+                    success, error_message = save_portfolios_to_file(st.session_state.portfolios)
+
+                    if success:
+                        st.success(f"✅ Portfolio '{current_name}' saved successfully!")
+                        st.session_state.portfolio_select = current_name
+                        time.sleep(1)
+                        st.rerun()
+                    else: st.error(f"🚨 SAVE FAILED: {error_message}")
+            
+            # --- Lógica de Eliminación ---
             if submitted_delete:
-                 if selected_portfolio_name != "(Create New Portfolio)" and selected_portfolio_name in st.session_state.portfolios:
-                      del st.session_state.portfolios[selected_portfolio_name]
-                      save_portfolios_to_file(st.session_state.portfolios)
-                      st.success(f"Portfolio '{selected_portfolio_name}' deleted.")
-                      st.session_state.portfolio_select = "(Create New Portfolio)"; st.rerun()
-                 elif selected_portfolio_name == "(Create New Portfolio)": st.warning("Cannot delete '(Create New Portfolio)'.")
-                 else: st.error(f"Portfolio '{selected_portfolio_name}' not found.")
+                portfolio_to_delete = st.session_state.portfolio_select
+                if st.session_state.delete_confirmation != portfolio_to_delete:
+                    st.session_state.delete_confirmation = portfolio_to_delete
+                    st.warning(f"Are you sure? Click delete again to confirm deletion of '{portfolio_to_delete}'.")
+                else:
+                    del st.session_state.portfolios[portfolio_to_delete]
+                    success, error_message = save_portfolios_to_file(st.session_state.portfolios)
+                    
+                    if success:
+                        st.success(f"✅ Portfolio '{portfolio_to_delete}' has been deleted.")
+                        st.session_state.delete_confirmation = None
+                        st.session_state.portfolio_select = "(Create New Portfolio)"
+                        time.sleep(1)
+                        st.rerun()
+                    else: st.error(f"🚨 DELETE FAILED: {error_message}")
+    
+    # Columna de la derecha para mostrar los portafolios guardados
     with col_display:
         st.subheader("Saved Portfolios")
-        if not st.session_state.portfolios: st.info("No portfolios defined yet.")
+        if not st.session_state.portfolios:
+            st.info("No portfolios defined yet.")
         else:
-            st.markdown("**List of Saved Portfolios:**")
-            sorted_names = sorted(st.session_state.portfolios.keys())
-            if len(sorted_names) > 10: st.info("Showing first 10 portfolios. Scroll down for more.")
-            displayed_count = 0
-            for name in sorted_names:
-                with st.expander(f"{name}", expanded=(displayed_count < 5)):
-                    portfolio_data = st.session_state.portfolios[name]
-                    df = pd.DataFrame(list(portfolio_data.items()), columns=['Ticker', 'Weight'])
-                    df['Weight %'] = (df['Weight'] * 100).map('{:.2f}%'.format)
-                    st.dataframe(df[['Ticker', 'Weight %']], hide_index=True, use_container_width=True)
-                    sum_w = df['Weight'].sum()
-                    sum_text = f"Total Weight: {sum_w:.4f}"
-                    if np.isclose(sum_w, 1.0): st.caption(f"✅ {sum_text}")
-                    else: st.caption(f"⚠️ {sum_text} (Should be 1.0)")
-                displayed_count += 1
+            for name in sorted(st.session_state.portfolios.keys()):
+                with st.expander(f"**{name}**", expanded=(name == st.session_state.portfolio_select)):
+                    df = pd.DataFrame(st.session_state.portfolios[name].items(), columns=['Ticker', 'Weight'])
+                    st.dataframe(df.style.format({'Weight': '{:.2%}'}), hide_index=True, use_container_width=True)
 
+# --- FUNCIÓN DE PÁGINA DE RETORNOS DE PORTAFOLIO MODIFICADA ---
 def page_view_portfolio_returns():
     st.header("📊 Portfolio Performance Viewer & Optimizer")
     if 'portfolios' not in st.session_state or not st.session_state.portfolios:
@@ -1251,6 +1819,10 @@ def page_view_portfolio_returns():
         prices_df_pf,
         aggregate_weights
     )
+    
+    # Initialize metric variables outside the 'if' block for the chat
+    total_return, annualized_return, annualized_volatility, hist_var, max_dd = 0.0, 0.0, 0.0, 0.0, 0.0
+
     if renormalized_info: st.warning(renormalized_info)
     if portfolio_cumulative_returns_pf is not None:
         st.subheader(f"Performance Chart: '{analysis_title}'")
@@ -1267,6 +1839,42 @@ def page_view_portfolio_returns():
         with col_m1: st.metric(label="Total Return", value=f"{total_return:.2f}%")
         with col_m2: st.metric(label="Annualized Return (CAGR)", value=f"{annualized_return:.2f}%")
         with col_m3: st.metric(label="Annualized Volatility (Std Dev)", value=f"{annualized_volatility:.2f}%", help="Based on daily returns, 252 trading days/year.")
+        
+        # --- SECCIÓN DE VAR AGREGADA ---
+        st.subheader("Value at Risk (VaR)")
+        confidence_level_var = st.slider(
+            "Confidence Level for VaR", 
+            min_value=0.90, 
+            max_value=0.99, 
+            value=0.95, 
+            step=0.01,
+            format="%.2f",
+            key="var_confidence_slider",
+            help="The confidence level for the VaR calculation. A 95% level means we are 95% confident the daily loss will not exceed the calculated VaR."
+        )
+        if portfolio_daily_returns_pf is not None and not portfolio_daily_returns_pf.empty:
+            hist_var, para_var = calculate_var(portfolio_daily_returns_pf, confidence_level=confidence_level_var)
+            if hist_var is not None and para_var is not None:
+                col_var1, col_var2 = st.columns(2)
+                with col_var1:
+                    st.metric(
+                        label=f"Historical VaR ({confidence_level_var:.0%})",
+                        value=f"{hist_var*100:.2f}%",
+                        help="Based on the actual worst-case daily returns from the historical data for this period."
+                    )
+                with col_var2:
+                    st.metric(
+                        label=f"Parametric VaR ({confidence_level_var:.0%})",
+                        value=f"{para_var*100:.2f}%",
+                        help="Calculated assuming returns follow a normal distribution. May underestimate risk in volatile markets."
+                    )
+                st.caption(f"Interpretación: Con {confidence_level_var:.0%} de confianza, el portfolio's maximum loss in a single day is not expected to exceed these values.")
+            else:
+                st.warning("Could not calculate VaR. Not enough daily return data available for the selected period.")
+        
+        # Calculate Drawdowns here so 'max_dd' is available for the Chat section
+        drawdown_series, max_dd, max_dd_date = calculate_drawdowns(portfolio_cumulative_returns_pf)
+
         with st.expander("View Detailed Data Tables"):
             if portfolio_daily_returns_pf is not None:
                 st.markdown("**Calculated Daily Returns** (Individual or Aggregated)")
@@ -1285,6 +1893,12 @@ def page_view_portfolio_returns():
         st.error("Could not calculate portfolio performance after fetching data.")
         if prices_df_pf is not None and not prices_df_pf.empty:
              with st.expander("View Fetched Price Data (for debugging)"): st.dataframe(prices_df_pf)
+        
+        # Set dummy values for chat context if calculation failed
+        total_return, annualized_return, annualized_volatility = 0.0, 0.0, 0.0
+        hist_var, max_dd = 0.0, 0.0 # Using 0.0 ensures variables exist for the Chat section.
+
+
     st.markdown("---")
     st.subheader("🚀 Portfolio Optimization")
     if not pypfopt_installed:
@@ -1295,8 +1909,7 @@ def page_view_portfolio_returns():
         st.write(f"Optimize weights for portfolio: **'{portfolio_to_optimize}'**")
         st.caption(f"Using historical price data from {start_date_pf.strftime('%Y-%m-%d')} to {end_date_pf.strftime('%Y-%m-%d')}.")
         prices_for_opt = prices_df_pf.copy()
-        # available_opt_tickers = prices_for_opt.columns.tolist() # No se usa explicitamente
-        if len(prices_for_opt.columns) < 2: # Chequeo directo en vez de usar variable
+        if len(prices_for_opt.columns) < 2:
              st.warning("Optimization requires at least 2 assets with valid price data.")
              return
         opt_objective = st.selectbox(
@@ -1322,13 +1935,12 @@ def page_view_portfolio_returns():
                     mu = expected_returns.mean_historical_return(prices_for_opt, frequency=252)
                     S = risk_models.sample_cov(prices_for_opt, frequency=252)
                     ef = EfficientFrontier(mu, S, weight_bounds=(0, 1))
-                    # weights_optimized = None # No es necesario inicializar a None
                     if opt_objective == "Maximize Sharpe Ratio (Best Risk-Adjusted Return)":
                         ef.max_sharpe(risk_free_rate=risk_free_rate)
                     elif opt_objective == "Minimize Volatility (Lowest Risk)":
                         ef.min_volatility()
                     elif opt_objective == "Maximize Quadratic Utility (Balance Risk/Return)":
-                        risk_aversion_param = 2 # Podría ser un input del usuario
+                        risk_aversion_param = 2
                         ef.max_quadratic_utility(risk_aversion=risk_aversion_param)
                         st.caption(f"(Using Risk Aversion = {risk_aversion_param})")
                     weights_optimized = ef.clean_weights()
@@ -1359,76 +1971,342 @@ def page_view_portfolio_returns():
          st.warning("Cannot optimize because no valid price data was loaded for the selected portfolio and period.")
     else:
         st.info("Optimization is available when a single portfolio with valid price data is selected.")
+    
+    # --- NUEVO: Chat de Análisis de Portafolio ---
+    st.markdown("---")
+    st.header("🤖 Chat de Análisis de Portafolio")
 
-def page_event_analyzer():
-    st.header("📰 Event Analyzer (Simple Demo)")
-    st.warning("""
-    **DISCLAIMER:** This tool performs a **very basic keyword search**.
-    It **DOES NOT** understand context, nuance, sarcasm, or the actual market impact of news.
-    Results are **NOT** financial advice and should **NOT** be used for investment decisions.
-    This is purely a conceptual demonstration.
+    if not selected_names or portfolio_daily_returns_pf is None:
+        st.info("Selecciona un portafolio arriba y asegura que los datos de rendimiento se hayan cargado para activar el chat de análisis.")
+        return
+
+    # Usamos el primer portafolio seleccionado como clave para el historial de chat
+    chat_key = selected_names[0]
+    if chat_key not in st.session_state.portfolio_chat_messages:
+        st.session_state.portfolio_chat_messages[chat_key] = []
+
+    st.markdown(f"Conversando sobre **'{analysis_title}'**. Puedes subir documentos adicionales para contextualizar tus preguntas.")
+
+    # Widgets para subir contexto adicional
+    chat_uploaded_pdfs = st.file_uploader(
+        "Sube PDFs (informes, noticias relevantes)", type="pdf", accept_multiple_files=True, key=f"chat_pdf_{chat_key}"
+    )
+
+    # Mostrar historial de chat para este portafolio
+    for message in st.session_state.portfolio_chat_messages[chat_key]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input(f"Pregunta sobre el rendimiento de '{analysis_title}'..."):
+        st.session_state.portfolio_chat_messages[chat_key].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            with st.spinner("Combinando datos y analizando..."):
+                # 1. Recopilar contexto CUANTITATIVO (los datos que ya calculaste)
+                quantitative_context = f"**Resumen de Rendimiento del Portafolio '{analysis_title}'**\n"
+                
+                # Aseguramos que las variables de métricas existan
+                if 'total_return' in locals():
+                    quantitative_context += f"- Retorno Total: {total_return:.2f}%\n"
+                    quantitative_context += f"- Retorno Anualizado (CAGR): {annualized_return:.2f}%\n"
+                    quantitative_context += f"- Volatilidad Anualizada: {annualized_volatility:.2f}%\n"
+                
+                # Check for VaR and Drawdown results
+                if 'hist_var' in locals() and hist_var is not None and hist_var != 0.0:
+                    quantitative_context += f"- VaR Histórico (95%): Pérdida diaria no debería exceder {hist_var*100:.2f}%\n"
+                
+                if 'max_dd' in locals() and max_dd != 0:
+                    quantitative_context += f"- Máximo Drawdown: {max_dd:.2%}\n"
+                
+                quantitative_context += "**Composición del Portafolio:**\n"
+                for ticker, weight in aggregate_weights.items():
+                    quantitative_context += f"- {ticker}: {weight:.2%}\n"
+
+                # 2. Recopilar contexto CUALITATIVO (nuevos documentos)
+                qualitative_context = ""
+                if chat_uploaded_pdfs:
+                    for pdf in chat_uploaded_pdfs:
+                        qualitative_context += f"--- INICIO DOCUMENTO ADICIONAL: {pdf.name} ---\n"
+                        qualitative_context += extract_text_from_pdf(pdf)
+                        qualitative_context += f"\n--- FIN DOCUMENTO ADICIONAL: {pdf.name} ---\n\n"
+
+                # 3. Construir el prompt final
+                system_prompt = """
+                Eres un asesor de inversiones IA. Tu tarea es responder a la pregunta del usuario combinando dos fuentes de información:
+                1.  **Datos Cuantitativos:** El rendimiento histórico y la composición del portafolio que te proporcionaré.
+                2.  **Datos Cualitativos:** El contenido de cualquier documento adicional que el usuario haya subido.
+                Cuando el usuario pregunte '¿qué hago con la acción X?', debes analizar su peso en el portafolio, su rendimiento implícito en los datos y cualquier noticia relevante en los documentos.
+                Proporciona una recomendación razonada (ej. 'considerar mantener', 'revisar debido a X riesgo', 'parece fuerte por Y motivo').
+                **IMPORTANTE:** Siempre incluye un descargo de responsabilidad de que esto no es un consejo financiero financiero real.
+                """
+                final_prompt = f"{system_prompt}\n\n**DATOS CUANTITATIVOS DEL PORTAFOLIO:**\n{quantitative_context}\n\n**DATOS CUALITATIVOS ADICIONALES:**\n{qualitative_context}\n\n**Pregunta del Usuario:**\n{prompt}"
+
+                # 4. Llamar a la API
+                response = get_hf_response(
+                    st.session_state.hf_api_key,
+                    st.session_state.hf_model,
+                    final_prompt,
+                    st.session_state.hf_temp,
+                    max_tokens=4096 # Damos más espacio para respuestas complejas
+                )
+
+                # 5. Mostrar respuesta
+                if response:
+                    message_placeholder.markdown(response)
+                    st.session_state.portfolio_chat_messages[chat_key].append({"role": "assistant", "content": response})
+                else:
+                    message_placeholder.markdown("No pude procesar la solicitud. Revisa la API Key.")
+                    st.session_state.portfolio_chat_messages[chat_key].append({"role": "assistant", "content": "Error."})
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+
+# --- NUEVA PÁGINA: GESTIÓN DE RIESGO ---
+def page_risk_management():
+    st.header("🛡️ Gestión de Riesgo del Portafolio")
+    st.markdown("""
+    Esta sección proporciona herramientas para analizar el riesgo de sus portafolios guardados. 
+    Analice el Valor en Riesgo (VaR), las caídas (drawdowns) y la correlación entre activos.
     """)
+
+    if 'portfolios' not in st.session_state or not st.session_state.portfolios:
+        st.warning("⚠️ No hay portafolios definidos. Por favor, vaya a la página 'Crear/Editar Portafolios' primero.")
+        return
+
+    portfolio_names = sorted(list(st.session_state.portfolios.keys()))
+    selected_name = st.selectbox(
+        "Seleccione un Portafolio para Analizar:",
+        options=portfolio_names,
+        key="risk_portfolio_select"
+    )
+    
+    if not selected_name:
+        st.info("Seleccione un portafolio para comenzar el análisis de riesgo.")
+        return
+
     st.markdown("---")
-    positive_keywords = [
-        "crecimiento", "supera", "acuerdo", "beneficio", "ganancia", "upgrade",
-        "expansión", "éxito", "innovación", "alianza", "optimista", "demanda alta",
-        "récord", "lanzamiento exitoso", "aumento", "mejora"
-    ]
-    negative_keywords = [
-        "caída", "pérdida", "impuesto", "arancel", "investigación", "demanda",
-        "retraso", "multa", "riesgo", "downgrade", "incertidumbre", "problema",
-        "descenso", "crisis", "recorte", "competencia", "regulación", "trump",
-        "aumento de impuestos"
-    ]
-    positive_keywords = [k.lower() for k in positive_keywords]
-    negative_keywords = [k.lower() for k in negative_keywords]
-    st.subheader("Input Data")
-    news_text = st.text_area("Paste News Snippet Here:", height=150, key="event_text")
-    affected_tickers_str = st.text_input("Enter Ticker(s) Potentially Affected (comma-separated):", key="event_tickers", placeholder="e.g., AAPL, TSLA")
-    analyze_button = st.button("Analyze Text", key="event_analyze_button")
+    st.subheader("Seleccionar Período de Análisis")
+    today_risk = datetime.today().date()
+    years_ago_risk = today_risk - timedelta(days=3*365)
+    
+    col_date1_risk, col_date2_risk = st.columns(2)
+    with col_date1_risk:
+        start_date_risk = st.date_input("Fecha de Inicio", years_ago_risk, key="risk_start_date")
+    with col_date2_risk:
+        end_date_risk = st.date_input("Fecha de Fin", today_risk, key="risk_end_date")
+
+    if start_date_risk >= end_date_risk:
+        st.error("Error: La fecha de inicio debe ser anterior a la fecha de fin.")
+        return
+
+    weights_dict = st.session_state.portfolios[selected_name]
+    tickers_to_fetch = list(weights_dict.keys())
+
+    if not tickers_to_fetch:
+         st.warning("El portafolio seleccionado no tiene tickers.")
+         return
+
+    # Fetch data and calculate returns
+    prices_df = fetch_stock_prices_for_portfolio(tickers_to_fetch, start_date_risk, end_date_risk)
+    
+    if prices_df is None or prices_df.empty:
+         st.error("No se pudieron obtener datos de precios para los tickers en el período seleccionado. No se puede realizar el análisis de riesgo.")
+         return
+         
+    daily_returns_portfolio, cumulative_returns_portfolio, renormalized_info = calculate_portfolio_performance(
+        prices_df,
+        weights_dict
+    )
+
+    if renormalized_info:
+        st.warning(renormalized_info)
+
+    if daily_returns_portfolio is None or cumulative_returns_portfolio is None:
+        st.error("No se pudo calcular el rendimiento del portafolio. Verifique los datos.")
+        return
+
+    # --- 1. Value at Risk (VaR) Section ---
     st.markdown("---")
-    st.subheader("Analysis Results")
-    if analyze_button and news_text and affected_tickers_str:
-        tickers = [t.strip().upper() for t in affected_tickers_str.split(',') if t.strip()]
-        if not tickers:
-            st.warning("Please enter at least one ticker symbol.")
-        else:
-            text_lower = news_text.lower()
-            positive_score = 0
-            negative_score = 0
-            found_pos_keywords = []
-            found_neg_keywords = []
-            for keyword in positive_keywords:
-                if keyword in text_lower:
-                    positive_score += 1
-                    found_pos_keywords.append(keyword)
-            for keyword in negative_keywords:
-                 if keyword in text_lower:
-                    negative_score += 1
-                    found_neg_keywords.append(keyword)
-            signal = "❓ **UNCLEAR SIGNAL**"
-            signal_color = "orange"
-            if positive_score > negative_score:
-                signal = "📈 **POTENTIAL UP SIGNAL**"
-                signal_color = "green"
-            elif negative_score > positive_score:
-                signal = "📉 **POTENTIAL DOWN SIGNAL**"
-                signal_color = "red"
-            for ticker in tickers:
-                st.markdown(f"### Signal for {ticker}:")
-                st.markdown(f"<span style='color:{signal_color}; font-size: 1.2em;'>{signal}</span>", unsafe_allow_html=True)
-            st.markdown("---")
-            col_kw1, col_kw2 = st.columns(2)
-            with col_kw1:
-                st.metric("Positive Keyword Hits", positive_score)
-                if found_pos_keywords: st.caption(f"Found: {', '.join(list(set(found_pos_keywords)))}")
-            with col_kw2:
-                st.metric("Negative Keyword Hits", negative_score)
-                if found_neg_keywords: st.caption(f"Found: {', '.join(list(set(found_neg_keywords)))}")
-    elif analyze_button:
-        st.warning("Please provide both the news text and at least one ticker symbol.")
+    st.subheader(f"1. Valor en Riesgo (VaR) para '{selected_name}'")
+    st.markdown("""
+    El VaR estima la pérdida potencial máxima de un portafolio en un período de tiempo (aquí, un día) dentro de un nivel de confianza dado.
+    - **VaR Histórico:** Se basa en los peores rendimientos diarios que ocurrieron realmente en el pasado.
+    - **VaR Paramétrico:** Asume que los rendimientos siguen una distribución normal (una campana de Gauss). Puede ser menos preciso si los mercados tienen "colas anchas" (eventos extremos más frecuentes de lo normal).
+    """)
+    
+    confidence_level_risk = st.slider(
+        "Nivel de Confianza para VaR", 
+        min_value=0.90, 
+        max_value=0.99, 
+        value=0.95, 
+        step=0.01,
+        format="%.2f",
+        key="risk_var_confidence_slider"
+    )
+
+    hist_var_risk, para_var_risk = calculate_var(daily_returns_portfolio, confidence_level=confidence_level_risk)
+
+    if hist_var_risk is not None and para_var_risk is not None:
+        col_var_risk1, col_var_risk2 = st.columns(2)
+        with col_var_risk1:
+            st.metric(
+                label=f"VaR Histórico ({confidence_level_risk:.0%})",
+                value=f"{hist_var_risk*100:.2f}%"
+            )
+        with col_var_risk2:
+             st.metric(
+                label=f"VaR Paramétrico ({confidence_level_risk:.0%})",
+                value=f"{para_var_risk*100:.2f}%"
+            )
+        st.caption(f"Interpretación: Con un {confidence_level_risk:.0%} de confianza, no se espera que la pérdida máxima del portafolio en un solo día supere estos valores.")
     else:
-        st.info("Enter text and tickers above and click 'Analyze Text'.")
+        st.warning("No se pudo calcular el VaR. No hay suficientes datos de rendimiento diario para el período seleccionado.")
+
+    # --- 2. Drawdown Analysis ---
+    st.markdown("---")
+    st.subheader(f"2. Análisis de Caídas (Drawdowns) para '{selected_name}'")
+    st.markdown("""
+    Un drawdown es una caída desde un pico hasta un valle en el valor de un portafolio. El **Máximo Drawdown** es la mayor pérdida porcentual que el portafolio ha experimentado en el período. Es un indicador clave del riesgo de pérdida que un inversor habría enfrentado.
+    """)
+    
+    drawdown_series, max_dd, max_dd_date = calculate_drawdowns(cumulative_returns_portfolio)
+
+    if drawdown_series is not None and not drawdown_series.empty:
+        col_dd1, col_dd2 = st.columns(2)
+        with col_dd1:
+            st.metric(
+                label="Máximo Drawdown",
+                value=f"{max_dd:.2%}",
+                help=f"La peor caída de pico a valle ocurrió alrededor de {max_dd_date.strftime('%Y-%m-%d') if max_dd_date else 'N/A'}."
+            )
+        
+        st.line_chart(drawdown_series.multiply(100)) # Multiply by 100 for better display
+        st.caption("Gráfico de Drawdown (%) a lo largo del tiempo. Valores más bajos indican mayores pérdidas desde el último pico.")
+    else:
+        st.warning("No se pudo calcular el análisis de Drawdown.")
+
+
+    # --- 3. Correlation Matrix ---
+    st.markdown("---")
+    st.subheader(f"3. Matriz de Correlación de Activos en '{selected_name}'")
+    st.markdown("""
+    La matriz de correlación muestra cómo se mueven los precios de los activos entre sí. Es fundamental para entender la diversificación.
+    - **Valores cercanos a +1 (verde oscuro):** Los activos se mueven fuertemente en la misma dirección.
+    - **Valores cercanos a -1 (rojo oscuro):** Los activos se mueven en direcciones opuestas (buena diversificación).
+    - **Valores cercanos a 0 (blanco/amarillo):** Hay poca o ninguna relación en sus movimientos.
+    """)
+    
+    # Use only tickers that are actually in the prices_df columns
+    valid_tickers_corr = [t for t in tickers_to_fetch if t in prices_df.columns]
+    if len(valid_tickers_corr) > 1:
+        asset_returns = prices_df[valid_tickers_corr].pct_change().dropna()
+        corr_matrix = asset_returns.corr()
+        
+        fig_corr, ax_corr = plt.subplots(figsize=(max(6, len(corr_matrix.columns)*0.8), max(5, len(corr_matrix.columns)*0.6)))
+        cax = ax_corr.matshow(corr_matrix, cmap='RdYlGn', vmin=-1, vmax=1)
+        fig_corr.colorbar(cax)
+        
+        ax_corr.set_xticks(np.arange(len(corr_matrix.columns)))
+        ax_corr.set_yticks(np.arange(len(corr_matrix.columns)))
+        ax_corr.set_xticklabels(corr_matrix.columns, rotation=90, ha="center")
+        ax_corr.set_yticklabels(corr_matrix.columns)
+        
+        # Loop over data dimensions and create text annotations.
+        for i in range(len(corr_matrix.columns)):
+            for j in range(len(corr_matrix.columns)):
+                ax_corr.text(j, i, f"{corr_matrix.iloc[i, j]:.2f}",
+                               ha="center", va="center", color="black", fontsize=8)
+        
+        ax_corr.set_title(f"Matriz de Correlación de Rendimientos Diarios\n({start_date_risk.strftime('%Y-%m-%d')} a {end_date_risk.strftime('%Y-%m-%d')})", pad=20)
+        fig_corr.tight_layout(pad=1.5)
+        st.pyplot(fig_corr)
+        plt.close(fig_corr) # Close plot to free memory
+    else:
+        st.info("La matriz de correlación requiere al menos 2 activos en el portafolio con datos de precios válidos.")
+
+
+# --- NUEVA PÁGINA DE CHAT (REEMPLAZA A EVENT ANALYZER) ---
+def page_investment_insights_chat():
+    st.header("🤖 Chat de Análisis Cualitativo")
+    st.markdown("""
+    Sube informes, noticias o pega texto para analizar. Pregunta a la IA sobre el sentimiento, los puntos clave,
+    los riesgos mencionados o el posible impacto en el valor de una acción.
+    """)
+
+    # Inicializar historial de chat si no existe
+    if "insights_messages" not in st.session_state:
+        st.session_state.insights_messages = []
+
+    # Widgets para subir documentos y pegar texto (fuera del bucle de chat)
+    with st.sidebar:
+        st.subheader("Contexto para el Chat de Insights")
+        uploaded_pdfs = st.file_uploader(
+            "Sube PDFs (noticias, informes)", type="pdf", accept_multiple_files=True, key="insights_pdf"
+        )
+        pasted_text = st.text_area("O pega texto aquí", height=150, key="insights_text")
+
+    # Mostrar historial de chat
+    for message in st.session_state.insights_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Pregunta sobre los documentos o el texto..."):
+        # Añadir mensaje del usuario al historial
+        st.session_state.insights_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Preparar la respuesta de la IA
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            with st.spinner("Analizando y pensando..."):
+                # 1. Recopilar todo el contexto de texto
+                context_text = ""
+                if uploaded_pdfs:
+                    for pdf in uploaded_pdfs:
+                        context_text += f"--- INICIO DEL DOCUMENTO: {pdf.name} ---\n"
+                        context_text += extract_text_from_pdf(pdf)
+                        context_text += f"\n--- FIN DEL DOCUMENTO: {pdf.name} ---\n\n"
+                if pasted_text:
+                    context_text += f"--- INICIO DEL TEXTO PEGADO ---\n"
+                    context_text += pasted_text
+                    context_text += f"\n--- FIN DEL TEXTO PEGADO ---\n\n"
+
+                # 2. Construir el prompt final
+                system_prompt = """
+                Eres un analista financiero experto. Tu tarea es analizar los documentos y textos proporcionados
+                para responder a la pregunta del usuario. Enfócate en identificar el sentimiento (positivo, negativo, neutro),
+                los puntos clave, los riesgos potenciales y cómo la información podría afectar el valor de las acciones mencionadas.
+                Sé conciso, objetivo y basa tus respuestas únicamente en la información proporcionada.
+                """
+                final_prompt = f"{system_prompt}\n\n**Documentos y Textos de Contexto:**\n{context_text}\n\n**Pregunta del Usuario:**\n{prompt}"
+
+                # 3. Llamar a la API
+                response = get_hf_response(
+                    st.session_state.hf_api_key,
+                    st.session_state.hf_model,
+                    final_prompt,
+                    st.session_state.hf_temp
+                )
+
+                # 4. Mostrar respuesta
+                if response:
+                    message_placeholder.markdown(response)
+                    st.session_state.insights_messages.append({"role": "assistant", "content": response})
+                else:
+                    message_placeholder.markdown("No pude procesar la solicitud. Revisa la API Key y el error en la consola.")
+                    st.session_state.insights_messages.append({"role": "assistant", "content": "Error en la solicitud."})
 
 
 # --- PÁGINA: InvertirOnline API ---
@@ -1615,6 +2493,248 @@ def page_invertir_online():
                 st.dataframe(df_iol)
             except Exception as e:
                 st.caption(f"No se pudo convertir la respuesta a DataFrame o procesar columnas: {e}")
+                
+# --- NUEVAS FUNCIONES DE BACKEND PARA EL GENERADOR HOMEOSTÁTICO ---
+@st.cache_data
+def get_asset_metrics(_tickers):
+    """
+    Obtiene métricas financieras clave (Beta, P/E) para una lista de tickers usando yfinance.
+    _tickers es un tuple para que la caché funcione correctamente.
+    """
+    tickers = list(_tickers)
+    metrics = {}
+    
+    progress_bar = st.progress(0, text="Obteniendo métricas de activos...")
+    
+    for i, ticker in enumerate(tickers):
+        progress_bar.progress((i + 1) / len(tickers), text=f"Obteniendo métricas para {ticker}...")
+        try:
+            info = yf.Ticker(ticker).info
+            # CORRECCIÓN: Nos aseguramos de que info sea un diccionario válido y tenga al menos una clave
+            # yfinance a veces puede devolver None o un dict vacío en caso de error.
+            if info and 'symbol' in info: 
+                metrics[ticker] = {
+                    'beta': info.get('beta', 1.0),
+                    'pe': info.get('trailingPE', 30.0),
+                }
+            else:
+                # Si yfinance no devuelve nada útil, asignamos valores por defecto explícitamente.
+                # Esto previene KeyErrors si info es None.
+                metrics[ticker] = {'beta': 1.0, 'pe': 30.0}
+        except Exception as e:
+            # CORRECCIÓN: Nos aseguramos de asignar valores por defecto también en caso de una excepción
+            metrics[ticker] = {'beta': 1.0, 'pe': 30.0}
+            print(f"Advertencia: No se pudieron obtener métricas para {ticker} debido a un error. Usando valores por defecto. Error: {e}")
+    
+    progress_bar.empty()
+    return metrics
+
+def run_homeostatic_model(params):
+    (universe, k, n_portfolios, beta_range, pe_range, hhi_max) = params
+    
+    asset_metrics = get_asset_metrics(tuple(universe))
+    
+    plausible_portfolios = []
+    max_attempts = n_portfolios * 500 
+
+    for _ in range(max_attempts):
+        if len(plausible_portfolios) >= n_portfolios:
+            break
+            
+        portfolio_tickers = random.sample(universe, k)
+        
+        # CORRECCIÓN: Chequeo de seguridad. Verificar si todos los tickers del candidato
+        # tienen una entrada en el diccionario de métricas ANTES de acceder a ellas.
+        if not all(ticker in asset_metrics for ticker in portfolio_tickers):
+            # Si un ticker no está, este portafolio es inválido. Lo saltamos.
+            continue
+
+        betas = [asset_metrics[t]['beta'] for t in portfolio_tickers]
+        pes = [asset_metrics[t]['pe'] for t in portfolio_tickers]
+        
+        portfolio_beta = np.mean(betas)
+        portfolio_pe = np.mean(pes)
+        
+        if not (beta_range[0] <= portfolio_beta <= beta_range[1]):
+            continue
+        if not (pe_range[0] <= portfolio_pe <= pe_range[1]):
+            continue
+            
+        plausible_portfolios.append(sorted(portfolio_tickers))
+
+    unique_portfolios = list(set(tuple(p) for p in plausible_portfolios))
+    
+    return unique_portfolios
+
+
+# --- CÓDIGO DE LA NUEVA PÁGINA ---
+def page_homeostatic_generator():
+    st.header("🛠️ Generador de Portafolios Homeostáticos")
+    st.markdown("""
+    Esta herramienta utiliza el **Modelo Homeostático** para descubrir portafolios de inversión que son estructuralmente robustos y equilibrados.
+    En lugar de buscar el máximo retorno, busca carteras que se mantengan dentro de rangos de equilibrio en múltiples dimensiones de riesgo.
+    """)
+    
+    # --- 1. Definir Universo de Activos ---
+    st.subheader("1. Definir Universo de Activos")
+    default_tickers = "AAPL, MSFT, GOOG, AMZN, NVDA, META, JPM, JNJ, V, PG, MA, UNH, HD, BAC, PFE, KO, XOM, T, CSCO, INTC"
+    universe_input = st.text_area("Pega una lista de tickers (separados por coma o espacio) para el universo de búsqueda:", value=default_tickers, height=100)
+    
+    # CORRECCIÓN: Usar r'' para la expresión regular
+    universe = sorted(list(set([t.strip().upper() for t in re.split(r'[,\s]+', universe_input) if t.strip()])))
+    
+    if len(universe) < 6:
+        st.warning("Por favor, introduce al menos 6 tickers para formar un portafolio.")
+        return
+        
+    st.info(f"Universo de búsqueda definido con **{len(universe)}** activos únicos.")
+
+    # --- 2. Configurar Parámetros del Portafolio y Homeostasis ---
+    st.subheader("2. Configurar Filtros de Homeostasis")
+    
+    col_params1, col_params2 = st.columns(2)
+    with col_params1:
+        k_assets = st.slider("Número de Activos por Portafolio:", min_value=5, max_value=min(30, len(universe)), value=10)
+        n_portfolios_to_gen = st.number_input("Número de portafolios plausibles a generar:", min_value=10, max_value=10000, value=100)
+    
+    with col_params2:
+        st.info("Configura los rangos aceptables para las 'señales vitales' de los portafolios.")
+        
+    col_filters1, col_filters2 = st.columns(2)
+    with col_filters1:
+        beta_range = st.slider("Rango de Beta del Portafolio (Riesgo de Mercado):", 0.0, 2.0, (0.8, 1.2), step=0.05)
+    with col_filters2:
+        pe_range = st.slider("Rango de P/E Ratio Promedio (Valuación):", 5.0, 100.0, (15.0, 40.0), step=1.0)
+    
+    # El HHI para un portafolio equiponderado de k activos es 1/k.
+    hhi_max = 1.0 / k_assets 
+    st.caption(f"Filtro de Diversificación (HHI) implícito: Se buscarán portafolios equiponderados de {k_assets} activos, lo que garantiza una diversificación estructural máxima (HHI de {hhi_max:.3f}).")
+    
+    # --- Explicación Matemática ---
+    with st.expander("📖 Explicación Matemática del Modelo Homeostático de Portafolios"):
+        st.markdown("""
+        El modelo busca descubrir un conjunto de portafolios robustos `P_robusto` que cumplan con una serie de restricciones de homeostasis. Se define de la siguiente manera:
+        
+        **1. Definiciones:**
+        - **A**: Universo de activos disponibles.
+        - **P**: Un portafolio `P = {a₁, ..., a_k}`.
+        - **V(P)**: Una función que calcula las "señales vitales" de un portafolio: `V(P) → [β_p(P), P/E_p(P), HHI(P), ...]`
+        - **R**: El conjunto de restricciones o rangos homeostáticos definidos por el usuario.
+
+        **2. La Fórmula Canónica:**
+        El conjunto `P_robusto` se define como:
+        
+        `P_robusto = { P ⊆ A | |P| = k ∧ (V(P) ∈ R) }`
+        
+        Esto se lee como: "El conjunto de todos los portafolios P que son un subconjunto del universo de activos, tienen un tamaño k, y cuyo vector de señales vitales V(P) se encuentra dentro de los rangos de homeostasis R."
+
+        **Métricas de Homeostasis Implementadas:**
+        - **Filtro de Riesgo Sistémico:** El **Beta ponderado (`β_p`)** del portafolio se mantiene en un rango, evitando exposiciones extremas al mercado.
+        - **Filtro de Valuación:** El **Price-to-Earnings (P/E) Ratio ponderado** se mantiene en un rango saludable para evitar burbujas o trampas de valor.
+        - **Filtro de Diversificación:** Se exige una estructura equiponderada, lo que maximiza la diversificación y minimiza el **Índice de Herfindahl-Hirschman (HHI)**.
+        """)
+        
+    # --- Ejecución del Modelo ---
+    if st.button("🧬 Generar Portafolios Homeostáticos", type="primary"):
+        params = (universe, k_assets, n_portfolios_to_gen, beta_range, pe_range, hhi_max)
+        with st.spinner("Ejecutando Modelo Homeostático Híbrido... (Esto puede tardar varios minutos la primera vez mientras se descargan las métricas)"):
+            generated_portfolios = run_homeostatic_model(params)
+        
+        st.session_state.generated_portfolios = generated_portfolios
+        
+        if not generated_portfolios:
+            st.error("No se encontraron portafolios que cumplieran con los estrictos filtros de homeostasis. Intenta ampliar los rangos de Beta o P/E, o aumentar el universo de activos.")
+        else:
+            st.success(f"¡Éxito! Se generaron **{len(generated_portfolios)}** portafolios robustos.")
+    
+    # --- Resultados y Opción de Guardar ---
+    if 'generated_portfolios' in st.session_state and st.session_state.generated_portfolios:
+        st.subheader("Portafolios Generados")
+        portfolios_to_display = st.session_state.generated_portfolios
+
+        for i, portfolio in enumerate(portfolios_to_display[:50]): # Mostramos un máximo de 50
+            col_portfolio, col_button = st.columns([4, 1])
+            with col_portfolio:
+                st.code(", ".join(portfolio))
+            with col_button:
+                portfolio_name = f"Homeostatico-{i+1}-{datetime.now().strftime('%Y%m%d')}"
+                if st.button(f"Guardar como '{portfolio_name}'", key=f"save_btn_{i}"):
+                    # Guardar con pesos iguales
+                    weights = {ticker: 1.0 / len(portfolio) for ticker in portfolio}
+                    st.session_state.portfolios[portfolio_name] = weights
+                    success, error_msg = save_portfolios_to_file(st.session_state.portfolios)
+                    if success:
+                        st.toast(f"✅ Portafolio '{portfolio_name}' guardado exitosamente!")
+                    else:
+                        st.error(error_msg)
+                        
+        if len(portfolios_to_display) > 50:
+            st.info("Se muestran los primeros 50 portafolios generados.")
+            
+        st.markdown("---")
+        st.info("Los portafolios guardados ahora están disponibles en las páginas 'Create/Edit Portfolios', 'View Portfolio Returns' y 'Gestión de Riesgo' para un análisis detallado.")
+
+
+# --- INTEGRACIÓN CON LA IA: EL ASISTENTE DE ESTRATEGIA ---
+def page_ai_strategy_assistant():
+    st.header("🧠 Asistente de Estrategia IA")
+    st.markdown("""
+    Describe tu objetivo de inversión en lenguaje natural, y la IA lo traducirá en un conjunto de **restricciones cuantitativas**
+    para el **Generador de Portafolios Homeostáticos**.
+    """)
+    
+    user_strategy_prompt = st.text_area(
+        "Describe tu estrategia de inversión:",
+        height=150,
+        placeholder="Ej: 'Busco un portafolio de 15 acciones tecnológicas, pero no muy riesgoso. Quiero evitar empresas sobrevaloradas (burbujas) y enfocarme en las más grandes y establecidas del S&P 500. No quiero apostar todo a la IA, busco algo de diversificación dentro del sector tech.'"
+    )
+
+    if st.button("Traducir Estrategia a Filtros", type="primary"):
+        if not user_strategy_prompt:
+            st.warning("Por favor, describe tu estrategia.")
+        else:
+            system_prompt = """
+            Eres un experto en finanzas cuantitativas (Quant). Tu tarea es traducir la estrategia de inversión de un usuario en un conjunto de restricciones JSON para un modelo de optimización. Las claves del JSON que puedes generar son: 'k_assets', 'beta_range', 'pe_range', 'universe'.
+
+            - 'k_assets' (integer): El número de activos en el portafolio.
+            - 'beta_range' (array of two floats): [min_beta, max_beta]. Un portafolio de bajo riesgo tiene un Beta cercano a 0.8. Uno de mercado es 1.0. Uno agresivo es > 1.2.
+            - 'pe_range' (array of two floats): [min_pe, max_pe]. Estrategias "Value" (evitar sobrevaloración) tienen un P/E bajo (ej. 10-25). Estrategias "Growth" aceptan P/E altos (ej. 30-80).
+            - 'universe' (string): Una lista de tickers de acciones, separados por coma, que se ajusten a la descripción del usuario (ej. si pide 'grandes tecnológicas', lista los tickers de las FAANG y otras similares).
+
+            Analiza la descripción del usuario y responde **SOLAMENTE CON UN BLOQUE DE CÓDIGO JSON VÁLIDO Y NADA MÁS**.
+            """
+            
+            final_prompt = f"{system_prompt}\n\n**Descripción del Usuario:**\n{user_strategy_prompt}"
+            
+            with st.spinner("IA Quant analizando tu estrategia..."):
+                response = get_hf_response(
+                    st.session_state.hf_api_key,
+                    st.session_state.hf_model,
+                    final_prompt,
+                    temperature=0.1 # Queremos una respuesta precisa y estructurada
+                )
+            
+            if response:
+                st.subheader("Filtros Cuantitativos Sugeridos por la IA")
+                st.code(response, language="json")
+                
+                try:
+                    # Limpiar la respuesta para que sea un JSON válido
+                    # Algunos modelos añaden ```json y ``` al principio/final
+                    json_text = re.search(r'\{.*\}', response, re.DOTALL).group(0)
+                    suggested_params = json.loads(json_text)
+                    
+                    st.subheader("Aplicación Práctica")
+                    st.markdown(
+                        "Puedes copiar y pegar el **Universo** sugerido y ajustar los **Filtros** "
+                        "en la página **'Generador Homeostático'** para ejecutar el modelo con esta estrategia."
+                    )
+                except (json.JSONDecodeError, AttributeError):
+                    st.error("La IA generó una respuesta, pero no pude interpretarla como un JSON válido. Inténtalo de nuevo, quizás reformulando tu estrategia.")
+                    st.text(response)
+            else:
+                st.error("No se pudo obtener una respuesta de la IA.")
+
 
 # --- Initialize Session State ---
 default_session_values = {
@@ -1623,12 +2743,16 @@ default_session_values = {
     'apply_outlier_treatment': False, 'iqr_factor': 1.5,
     'iol_logged_in': False, 'iol_access_token': None, 'iol_token_data': None,
     'iol_user': None, 'iol_last_data': None, 'iol_last_error': None,
-    'iol_parsed_tickers_info': [], 'iol_parsed_tickers_list': []
+    'iol_parsed_tickers_info': [], 'iol_parsed_tickers_list': [],
+    # --- NUEVAS CLAVES A AÑADIR ---
+    'hf_api_key': "",
+    'insights_messages': [], # Historial para el chat de insights
+    'portfolio_chat_messages': {}, # Un historial por portafolio
 }
 for key, value in default_session_values.items():
     if key not in st.session_state:
         st.session_state[key] = value
-
+        
 if 'portfolios' not in st.session_state:
     st.session_state.portfolios = load_portfolios_from_file()
 elif not st.session_state.portfolios and os.path.exists(PORTFOLIO_FILE): # Cargar si está vacío pero existe el archivo
@@ -1638,6 +2762,31 @@ elif not st.session_state.portfolios and os.path.exists(PORTFOLIO_FILE): # Carga
 
 
 # --- Sidebar Setup ---
+st.sidebar.title("Configuración General")
+
+# --- NUEVO: Configuración de la IA ---
+st.sidebar.header("🤖 Asistente IA (Hugging Face)")
+hf_api_key = st.sidebar.text_input(
+    "Hugging Face API Key",
+    type="password",
+    value=st.session_state.get('hf_api_key', ''),
+    help="Introduce tu clave aquí. No se guarda permanentemente."
+)
+# Guardamos la clave en el session state para que persista entre páginas
+if hf_api_key:
+    st.session_state.hf_api_key = hf_api_key
+
+st.session_state.hf_model = st.sidebar.selectbox(
+    "Modelo de Lenguaje",
+    ["mistralai/Mixtral-8x7B-Instruct-v0.1", "meta-llama/Meta-Llama-3-8B-Instruct", "google/gemma-7b-it"],
+    help="Elige el modelo de IA para las tareas de análisis de texto."
+)
+st.session_state.hf_temp = st.sidebar.slider(
+    "Temperatura (Creatividad)", 0.1, 1.0, 0.5, 0.1,
+    help="Bajo=preciso y repetitivo. Alto=creativo y variado."
+)
+
+
 st.sidebar.header("Forecasting: Data Selection")
 # ... (resto de la configuración de la sidebar de forecasting sin cambios) ...
 ticker_input = st.sidebar.text_area("Enter Tickers (for Forecasting)", "AAPL, MSFT, GOOG", help="e.g., AAPL, MSFT GOOG TSLA (Used for forecasting pages)")
@@ -1658,8 +2807,11 @@ st.sidebar.markdown("---")
 calculate_returns_flag = (data_type_choice == 'Daily Returns (%)')
 load_button = st.sidebar.button("Load & Process Data (for Forecasting)", key="load_data_button")
 
-if ticker_input: tickers_forecast = [t.strip().upper() for t in re.split('[,\s]+', ticker_input) if t.strip()] # Renombrar para evitar conflicto
-else: tickers_forecast = []
+if ticker_input: 
+    # CORRECCIÓN: Usar r'' para la expresión regular
+    tickers_forecast = [t.strip().upper() for t in re.split(r'[,\s]+', ticker_input) if t.strip()] 
+else: 
+    tickers_forecast = []
 
 if load_button and tickers_forecast:
     if start_date >= end_date: st.sidebar.error("Forecast Start date must be before End date.")
@@ -1730,7 +2882,7 @@ if load_button and tickers_forecast:
 
 # --- Carga de Tickers para IOL en Sidebar ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("IOL: Cargar Tickers (BCBA)")
+st.sidebar.subheader("IOL: Tickers (BCBA)")
 ocr_text_input_sidebar = st.sidebar.text_area(
     "Pega aquí tu lista de tickers (formato: Nombre (TICKER)):",
     height=150,
@@ -1786,10 +2938,13 @@ if st.sidebar.button("Parsear Tickers de Lista IOL", key="iol_parse_ocr_button_s
 st.sidebar.markdown("---"); st.sidebar.title("Navigation")
 page_options = [
     "Welcome Page",
+    "IA Strategy Assistant",       
+    "Homeostatic Generator", # <-- NUEVA PÁGINA    
     "Create/Edit Portfolios",
-    "View Portfolio Returns",
+    "View Portfolio Returns", # El chat de portafolio está aquí dentro
+    "Gestión de Riesgo",
     "InvertirOnline API",
-    "Event Analyzer (Simple Demo)",
+    "Chat de Análisis Cualitativo", # <-- NUEVO NOMBRE DE PÁGINA
     "--- Forecasting ---",
     "Data Visualization",
     "Series Decomposition",
@@ -1797,13 +2952,12 @@ page_options = [
     "Forecasting Models"
 ]
 selectable_page_options = [p for p in page_options if not p.startswith("---")]
-# forecasting_data_loaded = st.session_state.get('entities', []) # No se usa explicitamente aqui
 
 if 'selected_page' not in st.session_state or st.session_state.selected_page not in selectable_page_options:
     st.session_state.selected_page = "Welcome Page"
 
 try:
-    if st.session_state.selected_page not in page_options: # Asegurar que es una opción válida
+    if st.session_state.selected_page not in page_options:
         st.session_state.selected_page = "Welcome Page"
     page_idx = page_options.index(st.session_state.selected_page)
 except ValueError:
@@ -1825,18 +2979,39 @@ else:
     st.sidebar.warning("⚠️ PyPortfolioOpt not installed. Portfolio Optimization disabled.")
     st.sidebar.caption("Install via: `pip install PyPortfolioOpt`")
 
+if tbats_installed: st.sidebar.caption("✅ TBATS library is installed.")
+else:
+    st.sidebar.warning("⚠️ TBATS library not installed. TBATS model will be disabled.")
+    st.sidebar.caption("Install via: `pip install tbats`")
+
+if xgb_installed: st.sidebar.caption("✅ XGBoost library is installed.")
+else:
+    st.sidebar.warning("⚠️ XGBoost library not installed. XGBoost model will be disabled.")
+    st.sidebar.caption("Install via: `pip install xgboost`")
+
+if lgbm_installed: st.sidebar.caption("✅ LightGBM library is installed.")
+else:
+    st.sidebar.warning("⚠️ LightGBM library not installed. LightGBM model will be disabled.")
+    st.sidebar.caption("Install via: `pip install lightgbm`")
+    
 # --- Page Routing ---
 current_page_to_display = st.session_state.selected_page
 if current_page_to_display == "Welcome Page":
     main_page()
+elif current_page_to_display == "IA Strategy Assistant":
+    page_ai_strategy_assistant()
+elif current_page_to_display == "Homeostatic Generator": # <-- RUTA A LA NUEVA PÁGINA
+    page_homeostatic_generator()
 elif current_page_to_display == "Create/Edit Portfolios":
     page_create_portfolio()
 elif current_page_to_display == "View Portfolio Returns":
     page_view_portfolio_returns()
+elif current_page_to_display == "Gestión de Riesgo": # <-- ROUTING A LA NUEVA PÁGINA
+    page_risk_management()
 elif current_page_to_display == "InvertirOnline API":
     page_invertir_online()
-elif current_page_to_display == "Event Analyzer (Simple Demo)":
-    page_event_analyzer()
+elif current_page_to_display == "Chat de Análisis Cualitativo": # <-- NUEVA RUTA
+    page_investment_insights_chat()
 elif not st.session_state.get('entities', []) and current_page_to_display in ["Data Visualization", "Series Decomposition", "Stationarity & Lags", "Forecasting Models"]:
     st.warning("Forecasting data not loaded yet.")
     st.info("👈 Load data using the sidebar controls ('Load & Process Data (for Forecasting)') to enable these analysis pages.")
@@ -1851,5 +3026,3 @@ elif current_page_to_display == "Forecasting Models":
 else:
     st.error(f"Invalid page selected: {current_page_to_display}. Returning to Welcome Page.")
     main_page()
-
-
