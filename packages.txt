@@ -1,4 +1,3 @@
-# Required for compiling pystan (used by prophet) and other numerical libs
 gfortran
 libopenblas-dev
 libblas-dev
